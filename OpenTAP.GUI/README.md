@@ -1,4 +1,4 @@
-# OpenTAP GUI (Windows Forms port of the TUI)
+﻿# OpenTAP GUI (Windows Forms port of the TUI)
 
 A Windows desktop version of the OpenTAP TUI in this repository. Like the TUI it is an OpenTAP plugin,
 so it runs inside `tap.exe` with every installed plugin, instrument and setting available:
@@ -30,21 +30,51 @@ that can be installed into a bench with `tap package install`.
 |---|---|
 | `MainWindow` / `TUI` action | `MainForm` / `GuiAction` (`tap gui`) |
 | `TestPlanView` (tree, move-selection mode, copy/paste) | Tree on the left: context menu, drag and drop, Ctrl+click multi-select, Cut/Copy/Paste, Move Up/Down, Space to enable/disable |
-| `PropertiesView` + `PropEditProviders/*` | `AnnotationPropertyGrid`: standard Windows PropertyGrid driven by OpenTAP annotations (drop-downs, multi-select, Enabled&lt;T&gt;, file/folder browse, secure strings, actions, right-click Parameterize/Assign Output, validation ⚠) |
+| `PropertiesView` + `PropEditProviders/*` | `AnnotationPropertyGrid`: standard Windows PropertyGrid driven by OpenTAP annotations (drop-downs, multi-select, Enabled&lt;T&gt;, file/folder browse, secure strings, actions, right-click Parameterize/Assign Output, validation âš ) |
 | `DataGridEditProvider` | `CollectionEditorForm` (table editor for list properties) |
 | `NewPluginWindow` | `AddPluginDialog` (grouped, searchable) |
 | `ComponentSettingsWindow`, `ResourceSettingsWindow`, `ConnectionSettingsWindow` | `ComponentSettingsForm`, `ListSettingsForm` (Bench / Settings menus) |
-| `SettingsProfileWindow` | `ProfilesForm` (Bench → Profiles) |
+| `SettingsProfileWindow` | `ProfilesForm` (Bench â†’ Profiles) |
 | `TuiUserInput` | `GuiUserInput` (dialog steps, plan-load questions, ...) |
 | `LogPanelView` | `LogView` (colored by level, copy, clear) |
 | `Recovery` | `Recovery` (offers to recover unsaved plans after a crash) |
-| `TuiSettings` (log panel options) | `GuiSettings` (Settings → GUI Settings) |
+| `TuiSettings` (log panel options) | `GuiSettings` (Settings â†’ GUI Settings) |
 | `TuiPm`, `PackageManagerWindow`, `PackageListView`, `PackageDetailsView` | `gui-pm`, `PackageManagerForm` (searchable package list from the repositories in Package Manager settings, details, log) |
 | `PackageVersionSelectorWindow` | `PackageVersionsForm` (pick a version, Install / Uninstall with progress and Cancel) |
 | `TuiResults`, `ResultsViewerWindow` (RunExplorerWindow.cs) | `gui-results`, `ResultsViewerForm` (runs from the result stores in Results settings, check runs to plot) |
 | `ResultsWindow`, `ChartSettings`, `Plot`, `ExportDialogInput` | `ResultsForm`, `ChartSettings`, `ChartControl` (scatter / line / column, log axes, zoom, pan, tooltips, export through table-export plugins such as CSV) |
 
-New in the GUI (not in the TUI): the results viewer's **Step Results** grid (`StepResultsGrid`). Select one or
+New in the GUI (not in the TUI):
+
+- **Test plan view** (`TestPlanGrid`): step numbers (position in the whole plan, so they don't change when groups
+  are collapsed), alternating row shading, the running step highlighted and kept in view ("Follow running step"),
+  and a **Columns** drop-down for Duration and Verdict (shown by default, live while running), Type, Progress
+  (share of child steps completed, or running time compared with the last run) and Outputs. Right-click any
+  setting of a step in the Settings pane and choose **Show as Column in Test Plan** to add it as a column.
+  Column choices are remembered (GUI Settings). Live run information comes from `GuiRunTracker`, a hidden result
+  listener added to runs started from the GUI.
+- **Editor panels** (`Panels.cs`): View â†’ Panels lists every panel plugin (anything implementing Keysight's
+  `ITapDockPanel` from the "WPF Controls" package: Operator Panel, Live Results, Documentation, AI Assist, ...). The Keysight Editor's own window parts (Test Plan, Test Steps, Test Step Settings, Test Plan Settings, Log, Welcome) are left out: they only work inside the Editor and the GUI has its own versions.
+  A panel opens as a tab next to Settings; double-click or right-click its tab to float it in its own window,
+  and use "Dock next to Settings" to put it back. Open panels and their docked/floating state come back on the
+  next start. The GUI gives panels the current plan, selection, settings and Run, includes result listeners they
+  add (so Live Results updates during runs), and loads the Keysight theme resources panels expect. A panel that
+  fails to load is closed with a message instead of taking the GUI down. Tested with Operator Panel,
+  Documentation and Live Results 2 on OpenTAP 9.35.1; without "WPF Controls" the menu just says no panels are
+  installed. `Keysight.OpenTap.Wpf.dll` is referenced from the OpenTAP installation, not shipped
+  (`WpfControlsPath` in the project file).
+- **Breakpoints**: F9, Run â†’ Toggle Breakpoint or right-click a step. A red dot next to the step number marks
+  it. The run pauses just before the step starts (row shown in orange, status bar says where); F5 / â–¶ Continue
+  resumes, Abort stops. Uses OpenTAP's `TestPlan.BreakOffered`. Breakpoints are kept for the session (by step
+  ID), not saved in the plan file.
+- **File â†’ Recent Test Plans**: the last 5 plans opened or saved.
+- The Settings pane width and the test plan column order (drag column headers) are remembered (GUI Settings).
+- **Jump to Source**: right-click a setting whose value comes from another step's output (Assign Output, or an
+  input such as the If step's) to select that step and its output.
+- **Log panel** (`LogPanel`): Error / Warning / Information / Debug check boxes, a Sources drop-down, a Filter box
+  (only show matching lines), a Find box with â–²/â–¼ (highlights matches; finding turns Auto scroll off so the match
+  stays in view) and an Auto scroll check box. Also used in the package manager.
+- The results viewer's **Step Results** grid (`StepResultsGrid`). Select one or
 more runs to list every step with its verdict, result values, Min/Max limits and Check Limits. The limits come
 from each step's "Limits" settings as saved with the step run (the same data the TestRunViewerSqlite tool reads).
 Failed steps are highlighted, values outside their limits are marked red when Check Limits is on, columns sort

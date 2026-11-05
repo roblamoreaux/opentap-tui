@@ -303,7 +303,7 @@ namespace OpenTap.Gui
 
             var mainSplit = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Horizontal };
             mainSplit.Panel1.Controls.Add(topSplit);
-            mainSplit.Panel2.Controls.Add(new LogView { Dock = DockStyle.Fill });
+            mainSplit.Panel2.Controls.Add(new LogPanel { Dock = DockStyle.Fill });
             mainSplit.Panel2.Controls.Add(new Label { Text = "Log", Dock = DockStyle.Top, Height = 22, TextAlign = ContentAlignment.MiddleLeft, Font = new Font(Font, FontStyle.Bold) });
 
             Controls.Add(mainSplit);
@@ -473,7 +473,7 @@ namespace OpenTap.Gui
             var mainSplit = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Horizontal };
             mainSplit.Panel1.Controls.Add(split);
             mainSplit.Panel1.Controls.Add(bottom);
-            mainSplit.Panel2.Controls.Add(new LogView { Dock = DockStyle.Fill });
+            mainSplit.Panel2.Controls.Add(new LogPanel { Dock = DockStyle.Fill });
 
             Controls.Add(mainSplit);
 

@@ -35,6 +35,9 @@ namespace OpenTap.Gui
         /// <summary> Raised after a value has been written to the object. </summary>
         public event Action PropertiesChanged;
 
+        /// <summary> Extra right-click menu items for a property (e.g. "Show as Column in Test Plan"). </summary>
+        internal Func<AnnotationPropertyDescriptor, IEnumerable<ToolStripItem>> ExtraMenuItems;
+
         bool refreshQueued;
 
         public AnnotationPropertyGrid()
@@ -52,6 +55,31 @@ namespace OpenTap.Gui
             Source = obj;
             root = obj == null ? null : AnnotationCollection.Annotate(obj);
             SelectedObject = root == null ? null : new AnnotatedObject(this, root);
+        }
+
+        /// <summary> Selects the row of the member with this name (e.g. the output a setting gets its value from). </summary>
+        public bool SelectMember(string memberName)
+        {
+            var root = SelectedGridItem;
+            if (root == null || memberName == null) return false;
+            while (root.Parent != null) root = root.Parent;
+
+            GridItem Find(GridItem item)
+            {
+                if (item.PropertyDescriptor is AnnotationPropertyDescriptor d && d.Annotation.Get<IMemberAnnotation>()?.Member.Name == memberName)
+                    return item;
+                foreach (GridItem child in item.GridItems)
+                {
+                    var found = Find(child);
+                    if (found != null) return found;
+                }
+                return null;
+            }
+
+            var match = Find(root);
+            if (match == null) return false;
+            SelectedGridItem = match;
+            return true;
         }
 
         /// <summary> Re-reads all values from the object (e.g. after a test plan run changed something). </summary>
@@ -162,6 +190,12 @@ namespace OpenTap.Gui
                     };
                     menu.Items.Add(menuItem);
                 }
+            }
+            var extra = descriptor == null ? null : ExtraMenuItems?.Invoke(descriptor)?.ToList();
+            if (extra != null && extra.Count > 0)
+            {
+                if (menu.Items.Count > 0) menu.Items.Add(new ToolStripSeparator());
+                menu.Items.AddRange(extra.ToArray());
             }
             if (menu.Items.Count == 0)
                 e.Cancel = true;

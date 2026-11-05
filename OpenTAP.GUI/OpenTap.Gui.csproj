@@ -7,6 +7,11 @@
   <PropertyGroup>
     <TargetFramework>net9.0-windows</TargetFramework>
     <UseWindowsForms>true</UseWindowsForms>
+    <!-- WPF is only used to host OpenTAP editor panels (Operator Panel, Live Results, ...) inside WinForms. -->
+    <UseWPF>true</UseWPF>
+    <!-- Keysight's panel interfaces come from the "WPF Controls" package of the OpenTAP installation. They are
+         referenced but not shipped; the GUI works without them (the Panels menu is then empty). -->
+    <WpfControlsPath Condition="'$(WpfControlsPath)' == ''">C:\OpenTAP\Packages\WPF Controls\Keysight.OpenTap.Wpf.dll</WpfControlsPath>
     <Nullable>disable</Nullable>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
@@ -32,6 +37,10 @@
     <!-- Package manager API. Part of every OpenTAP installation, so it is referenced but not copied. -->
     <Reference Include="OpenTap.Package">
       <HintPath>$(NuGetPackageRoot)opentap\$(OpenTapVersion)\build\runtimes\win-x64\OpenTap.Package.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Keysight.OpenTap.Wpf">
+      <HintPath>$(WpfControlsPath)</HintPath>
       <Private>false</Private>
     </Reference>
     <!-- ITableExport (results viewer export). Ships with the OpenTAP package itself. -->

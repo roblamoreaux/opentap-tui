@@ -7,6 +7,7 @@ using System.Drawing;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Windows.Forms;
 using OpenTap.Plugins;
 
@@ -23,14 +24,14 @@ namespace OpenTap.Gui
         readonly string startupPath;
         bool unsaved;
 
-        // Test plan tree
-        readonly TreeView tree;
-        readonly Dictionary<object, TreeNode> nodes = new Dictionary<object, TreeNode>(ReferenceEqualityComparer.Instance);
-        readonly HashSet<ITestStep> marked = new HashSet<ITestStep>();
-        bool rebuilding, keepMarks;
+        // Test plan view
+        readonly TestPlanGrid planGrid;
+        readonly GuiRunTracker runTracker = new GuiRunTracker();
+        Dictionary<Guid, ITestStep> stepsById = new Dictionary<Guid, ITestStep>();
+        ToolStripDropDownButton columnsButton;
 
         readonly AnnotationPropertyGrid properties;
-        readonly LogView log;
+        readonly LogPanel log;
         readonly SplitContainer mainSplit, topSplit;
 
         // Status bar
@@ -42,15 +43,29 @@ namespace OpenTap.Gui
         bool running;
         readonly Timer runTimer = new Timer { Interval = 500 };
 
+        // Breakpoints (by step ID, so they survive reloading the same plan) and pausing.
+        readonly HashSet<Guid> breakpoints = new HashSet<Guid>();
+        readonly System.Threading.ManualResetEventSlim resumeRun = new System.Threading.ManualResetEventSlim(true);
+        bool paused;
+        string pausedStepName;
+        ToolStripMenuItem runMenuItem;
+        ToolStripButton runToolButton;
+
+        // Settings pane width is remembered once the window has its final layout.
+        bool layoutReady;
+
+        // After "Jump to Source", the output to select once the source step is shown.
+        string pendingSelectMember;
+
         // Menu/toolbar items that are enabled or disabled depending on the state.
         readonly List<(ToolStripItem Item, Func<bool> CanExecute)> commands = new List<(ToolStripItem, Func<bool>)>();
 
-        // Drag and drop
-        TreeNode dropHighlight;
-        (ITestStepParent Parent, int Index, TreeNode Node, DropPosition Position)? dropTarget;
-        enum DropPosition { Before, After, Into }
-
         public TestPlan Plan => plan;
+
+        // Editor panels (Operator Panel, Live Results, ...) shown as tabs next to Settings or floating.
+        TabControl settingsTabs;
+        PanelHost panels;
+        ToolStripMenuItem panelsMenu;
 
         public MainForm(string planPath)
         {
@@ -61,25 +76,40 @@ namespace OpenTap.Gui
             AllowDrop = true;
             LoadIcon();
 
-            // --- Tree ---
-            tree = new TreeView
+            // --- Test plan view ---
+            planGrid = new TestPlanGrid
             {
                 Dock = DockStyle.Fill,
-                HideSelection = false,
-                AllowDrop = true,
-                ShowNodeToolTips = true,
-                ItemHeight = 20,
+                PlanText = () => plan.Name + (unsaved ? " *" : ""),
+                CanDrag = CanEdit,
+                CanDrop = IsValidDrop,
+                CommandKey = OnPlanKey,
+                FollowRunningStep = GuiSettings.Current.FollowRunningStep,
+                HasBreakpoint = s => { lock (breakpoints) return breakpoints.Contains(s.Id); },
             };
-            tree.AfterSelect += OnTreeAfterSelect;
-            tree.NodeMouseClick += OnTreeNodeMouseClick;
-            tree.KeyDown += OnTreeKeyDown;
-            tree.AfterExpand += (s, e) => { if (!rebuilding && e.Node.Tag is ITestStep st) ChildItemVisibility.SetVisibility(st, ChildItemVisibility.Visibility.Visible); };
-            tree.AfterCollapse += (s, e) => { if (!rebuilding && e.Node.Tag is ITestStep st) ChildItemVisibility.SetVisibility(st, ChildItemVisibility.Visibility.Collapsed); };
-            tree.ItemDrag += OnTreeItemDrag;
-            tree.DragOver += OnTreeDragOver;
-            tree.DragDrop += OnTreeDragDrop;
-            tree.DragLeave += (s, e) => ClearDropHighlight();
-            tree.ContextMenuStrip = BuildTreeContextMenu();
+            planGrid.SetColumns((GuiSettings.Current.TestPlanColumns ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries));
+            planGrid.SelectionSettled += () =>
+            {
+                ShowSelectionProperties();
+                UpdateCommandState();
+                NotifyPanels(selection: true);
+            };
+            planGrid.ColumnOrderChanged += SaveColumnOrder;
+            planGrid.StepsDropped += MoveSteps;
+            planGrid.FileDropped += OpenDroppedFile;
+            planGrid.ContextMenuStrip = BuildTreeContextMenu();
+
+            // Live run information for the test plan view (result listener callbacks come from other threads).
+            runTracker.StepStarted = run => OnUi(() =>
+            {
+                if (stepsById.TryGetValue(run.TestStepId, out var step))
+                    planGrid.StepStarted(step, run.StartTime.Kind == DateTimeKind.Utc ? run.StartTime.ToLocalTime() : run.StartTime);
+            });
+            runTracker.StepCompleted = run => OnUi(() =>
+            {
+                if (stepsById.TryGetValue(run.TestStepId, out var step))
+                    planGrid.StepCompleted(step, run.Duration, run.Verdict);
+            });
 
             // --- Properties ---
             properties = new AnnotationPropertyGrid { Dock = DockStyle.Fill, IsReadOnly = () => plan.Locked };
@@ -88,15 +118,20 @@ namespace OpenTap.Gui
                 MarkChanged();
                 UpdateNodeTexts();
             };
+            properties.ExtraMenuItems = PropertyMenuItems;
 
             // --- Log ---
-            log = new LogView { Dock = DockStyle.Fill };
+            log = new LogPanel { Dock = DockStyle.Fill };
 
             topSplit = new SplitContainer { Dock = DockStyle.Fill };
-            topSplit.Panel1.Controls.Add(tree);
-            topSplit.Panel1.Controls.Add(new Label { Text = "Test Plan", Dock = DockStyle.Top, Height = 22, TextAlign = ContentAlignment.MiddleLeft, Font = new Font(Font, FontStyle.Bold) });
-            topSplit.Panel2.Controls.Add(properties);
-            topSplit.Panel2.Controls.Add(new Label { Text = "Settings", Dock = DockStyle.Top, Height = 22, TextAlign = ContentAlignment.MiddleLeft, Font = new Font(Font, FontStyle.Bold) });
+            topSplit.SplitterMoved += (s, e) => RememberSettingsPaneWidth();
+            topSplit.Panel1.Controls.Add(planGrid);
+            topSplit.Panel1.Controls.Add(BuildPlanToolbar());
+            settingsTabs = new TabControl { Dock = DockStyle.Fill, ShowToolTips = true };
+            var settingsTab = new TabPage("Settings");
+            settingsTab.Controls.Add(properties);
+            settingsTabs.TabPages.Add(settingsTab);
+            topSplit.Panel2.Controls.Add(settingsTabs);
 
             mainSplit = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Horizontal };
             mainSplit.Panel1.Controls.Add(topSplit);
@@ -117,7 +152,13 @@ namespace OpenTap.Gui
             MainMenuStrip = menu;
             Controls.Add(status);
 
-            runTimer.Tick += (s, e) => statusRun.Text = $"Running...  {DateTime.Now - runStart:hh\\:mm\\:ss}";
+            runTimer.Tick += (s, e) =>
+            {
+                statusRun.Text = paused
+                    ? $"Paused at breakpoint: {pausedStepName}  -  F5 to continue"
+                    : $"Running...  {DateTime.Now - runStart:hh\\:mm\\:ss}";
+                planGrid.RunTick();
+            };
 
             // Opening .TapPlan files by dropping them on the window.
             DragEnter += (s, e) => e.Effect = IsPlanFileDrop(e.Data) ? DragDropEffects.Copy : DragDropEffects.None;
@@ -128,10 +169,13 @@ namespace OpenTap.Gui
         {
             base.OnLoad(e);
             mainSplit.SplitterDistance = (int)(mainSplit.Height * 0.68);
-            topSplit.SplitterDistance = (int)(topSplit.Width * 0.45);
+            var settingsPercent = Math.Max(10, Math.Min(90, GuiSettings.Current.SettingsPanePercent));
+            topSplit.SplitterDistance = (int)(topSplit.Width * (100 - settingsPercent) / 100);
+            layoutReady = true;
             LoadStartupPlan();
+            RestorePanels();
             UpdateCommandState();
-            tree.Focus();
+            planGrid.Focus();
         }
 
         void LoadIcon()
@@ -178,6 +222,8 @@ namespace OpenTap.Gui
             var menu = new MenuStrip();
 
             var file = new ToolStripMenuItem("&File");
+            recentMenu = new ToolStripMenuItem("&Recent Test Plans");
+            recentMenu.DropDownItems.Add("(none)");
             file.DropDownItems.AddRange(new ToolStripItem[]
             {
                 Item("&New", NewPlan, Keys.Control | Keys.N, canExecute: () => !running),
@@ -185,8 +231,11 @@ namespace OpenTap.Gui
                 Item("&Save", () => SavePlan(plan.Path), Keys.Control | Keys.S),
                 Item("Save &As...", () => SavePlan(null), Keys.Control | Keys.Shift | Keys.S),
                 new ToolStripSeparator(),
+                recentMenu,
+                new ToolStripSeparator(),
                 Item("E&xit", Close, Keys.Alt | Keys.F4),
             });
+            file.DropDownOpening += (s, e) => BuildRecentMenu();
 
             // Clipboard / delete / move keys are only handled while the tree has focus (see OnTreeKeyDown), so they
             // are display-only here and keep working normally in text boxes.
@@ -194,36 +243,42 @@ namespace OpenTap.Gui
             edit.DropDownItems.AddRange(new ToolStripItem[]
             {
                 Item("&Insert Step...", () => InsertStep(false), Keys.Control | Keys.I, canExecute: CanEdit),
-                Item("Insert &Child Step...", () => InsertStep(true), Keys.Control | Keys.Shift | Keys.I, canExecute: () => CanEdit() && CanHaveChildren(tree.SelectedNode?.Tag)),
+                Item("Insert &Child Step...", () => InsertStep(true), Keys.Control | Keys.Shift | Keys.I, canExecute: () => CanEdit() && CanHaveChildren(planGrid.CurrentObject)),
                 new ToolStripSeparator(),
-                Item("Cu&t", CutStep, shortcutDisplay: "Ctrl+X", canExecute: () => CanEdit() && tree.SelectedNode?.Tag is ITestStep),
-                Item("&Copy", CopyStep, shortcutDisplay: "Ctrl+C", canExecute: () => tree.SelectedNode?.Tag is ITestStep),
+                Item("Cu&t", CutStep, shortcutDisplay: "Ctrl+X", canExecute: () => CanEdit() && planGrid.CurrentObject is ITestStep),
+                Item("&Copy", CopyStep, shortcutDisplay: "Ctrl+C", canExecute: () => planGrid.CurrentObject is ITestStep),
                 Item("&Paste", PasteStep, shortcutDisplay: "Ctrl+V", canExecute: CanEdit),
                 Item("&Delete", DeleteSteps, shortcutDisplay: "Del", canExecute: () => CanEdit() && HasSelectedStep()),
                 new ToolStripSeparator(),
-                Item("Move &Up", () => MoveSelected(-1), shortcutDisplay: "Alt+Up", canExecute: () => CanEdit() && tree.SelectedNode?.Tag is ITestStep),
-                Item("Move Do&wn", () => MoveSelected(1), shortcutDisplay: "Alt+Down", canExecute: () => CanEdit() && tree.SelectedNode?.Tag is ITestStep),
+                Item("Move &Up", () => MoveSelected(-1), shortcutDisplay: "Alt+Up", canExecute: () => CanEdit() && planGrid.CurrentObject is ITestStep),
+                Item("Move Do&wn", () => MoveSelected(1), shortcutDisplay: "Alt+Down", canExecute: () => CanEdit() && planGrid.CurrentObject is ITestStep),
                 Item("&Enable / Disable", ToggleEnabled, shortcutDisplay: "Space", canExecute: () => CanEdit() && HasSelectedStep()),
                 new ToolStripSeparator(),
                 Item("Test &Plan Settings", () => SelectObject(plan)),
             });
 
             var view = new ToolStripMenuItem("&View");
+            view.DropDownOpening += (s, e) => BuildPanelsMenu();
             view.DropDownItems.AddRange(new ToolStripItem[]
             {
-                Item("&Expand All", () => tree.ExpandAll()),
-                Item("&Collapse All", () => { tree.CollapseAll(); if (tree.Nodes.Count > 0) tree.Nodes[0].Expand(); }),
+                Item("&Expand All", () => planGrid.SetAllExpanded(true)),
+                Item("&Collapse All", () => planGrid.SetAllExpanded(false)),
                 new ToolStripSeparator(),
                 Item("C&lear Log", log.ClearLog),
+                new ToolStripSeparator(),
+                (panelsMenu = new ToolStripMenuItem("&Panels")),
             });
 
             var run = new ToolStripMenuItem("&Run");
             run.DropDownItems.AddRange(new ToolStripItem[]
             {
-                Item("&Run Test Plan", () => RunPlan(false), Keys.F5, canExecute: () => !running),
+                (runMenuItem = Item("&Run Test Plan", () => RunPlan(false), Keys.F5, canExecute: () => !running || paused)),
                 Item("Run &Selected Steps", () => RunPlan(true), Keys.Control | Keys.F5, canExecute: () => !running && HasSelectedStep()),
                 new ToolStripSeparator(),
                 Item("&Abort", AbortPlan, Keys.Shift | Keys.F5, canExecute: () => running),
+                new ToolStripSeparator(),
+                Item("Toggle &Breakpoint", ToggleBreakpoint, Keys.F9, canExecute: HasSelectedStep),
+                Item("&Clear All Breakpoints", ClearBreakpoints, canExecute: () => { lock (breakpoints) return breakpoints.Count > 0; }),
             });
 
             menu.Items.AddRange(new ToolStripItem[] { file, edit, view, run });
@@ -351,12 +406,12 @@ namespace OpenTap.Gui
                 ToolButton("Save", "Save test plan (Ctrl+S)", () => SavePlan(plan.Path)),
                 new ToolStripSeparator(),
                 ToolButton("Insert Step", "Insert a new step after the selected step (Ctrl+I)", () => InsertStep(false), CanEdit),
-                ToolButton("Insert Child", "Insert a new step as a child of the selected step (Ctrl+Shift+I)", () => InsertStep(true), () => CanEdit() && CanHaveChildren(tree.SelectedNode?.Tag)),
+                ToolButton("Insert Child", "Insert a new step as a child of the selected step (Ctrl+Shift+I)", () => InsertStep(true), () => CanEdit() && CanHaveChildren(planGrid.CurrentObject)),
                 ToolButton("Delete", "Delete the selected steps (Del)", DeleteSteps, () => CanEdit() && HasSelectedStep()),
-                ToolButton("▲", "Move up (Alt+Up)", () => MoveSelected(-1), () => CanEdit() && tree.SelectedNode?.Tag is ITestStep),
-                ToolButton("▼", "Move down (Alt+Down)", () => MoveSelected(1), () => CanEdit() && tree.SelectedNode?.Tag is ITestStep),
+                ToolButton("▲", "Move up (Alt+Up)", () => MoveSelected(-1), () => CanEdit() && planGrid.CurrentObject is ITestStep),
+                ToolButton("▼", "Move down (Alt+Down)", () => MoveSelected(1), () => CanEdit() && planGrid.CurrentObject is ITestStep),
                 new ToolStripSeparator(),
-                ToolButton("▶ Run", "Run the test plan (F5)", () => RunPlan(false), () => !running),
+                (runToolButton = ToolButton("▶ Run", "Run the test plan (F5)", () => RunPlan(false), () => !running || paused)),
                 ToolButton("■ Abort", "Abort the running test plan (Shift+F5)", AbortPlan, () => running),
             });
             return bar;
@@ -364,6 +419,12 @@ namespace OpenTap.Gui
 
         void UpdateCommandState()
         {
+            if (runMenuItem != null) runMenuItem.Text = paused ? "&Continue" : "&Run Test Plan";
+            if (runToolButton != null)
+            {
+                runToolButton.Text = paused ? "▶ Continue" : "▶ Run";
+                runToolButton.ToolTipText = paused ? "Continue from the breakpoint (F5)" : "Run the test plan (F5)";
+            }
             foreach (var (item, canExecute) in commands)
             {
                 try { item.Enabled = canExecute(); }
@@ -377,15 +438,17 @@ namespace OpenTap.Gui
             menu.Items.AddRange(new ToolStripItem[]
             {
                 Item("Insert Step...", () => InsertStep(false), canExecute: CanEdit),
-                Item("Insert Child Step...", () => InsertStep(true), canExecute: () => CanEdit() && CanHaveChildren(tree.SelectedNode?.Tag)),
+                Item("Insert Child Step...", () => InsertStep(true), canExecute: () => CanEdit() && CanHaveChildren(planGrid.CurrentObject)),
                 new ToolStripSeparator(),
-                Item("Cut", CutStep, shortcutDisplay: "Ctrl+X", canExecute: () => CanEdit() && tree.SelectedNode?.Tag is ITestStep),
-                Item("Copy", CopyStep, shortcutDisplay: "Ctrl+C", canExecute: () => tree.SelectedNode?.Tag is ITestStep),
+                Item("Cut", CutStep, shortcutDisplay: "Ctrl+X", canExecute: () => CanEdit() && planGrid.CurrentObject is ITestStep),
+                Item("Copy", CopyStep, shortcutDisplay: "Ctrl+C", canExecute: () => planGrid.CurrentObject is ITestStep),
                 Item("Paste", PasteStep, shortcutDisplay: "Ctrl+V", canExecute: CanEdit),
                 Item("Delete", DeleteSteps, shortcutDisplay: "Del", canExecute: () => CanEdit() && HasSelectedStep()),
                 new ToolStripSeparator(),
                 Item("Enable / Disable", ToggleEnabled, shortcutDisplay: "Space", canExecute: () => CanEdit() && HasSelectedStep()),
                 Item("Run Selected Steps", () => RunPlan(true), canExecute: () => !running && HasSelectedStep()),
+                new ToolStripSeparator(),
+                Item("Toggle Breakpoint", ToggleBreakpoint, shortcutDisplay: "F9", canExecute: HasSelectedStep),
             });
             menu.Opening += (s, e) => UpdateCommandState();
             return menu;
@@ -393,148 +456,19 @@ namespace OpenTap.Gui
 
         #endregion
 
-        #region Test plan tree
+        #region Test plan view
 
-        void RebuildTree(object select = null)
-        {
-            select ??= tree.SelectedNode?.Tag ?? plan;
-            var top = tree.TopNode?.Tag;
-            rebuilding = true;
-            tree.BeginUpdate();
-            try
-            {
-                tree.Nodes.Clear();
-                nodes.Clear();
-                var root = new TreeNode { Tag = plan, NodeFont = new Font(tree.Font, FontStyle.Bold) };
-                nodes[plan] = root;
-                AddStepNodes(root.Nodes, plan.ChildTestSteps);
-                tree.Nodes.Add(root);
-                root.Expand();
-                ApplyExpansion(root.Nodes);
-                marked.RemoveWhere(s => !nodes.ContainsKey(s));
-                UpdateNodeTexts();
-                if (top != null && nodes.TryGetValue(top, out var topNode)) tree.TopNode = topNode;
-            }
-            finally
-            {
-                tree.EndUpdate();
-                rebuilding = false;
-            }
-            SelectObject(nodes.ContainsKey(select) ? select : plan);
-        }
+        void RebuildTree(object select = null) =>
+            planGrid.Rebuild(plan, select == null ? null : new[] { select }, select);
 
-        void AddStepNodes(TreeNodeCollection collection, TestStepList steps)
-        {
-            foreach (var step in steps)
-            {
-                var node = new TreeNode { Tag = step };
-                nodes[step] = node;
-                collection.Add(node);
-                AddStepNodes(node.Nodes, step.ChildTestSteps);
-            }
-        }
+        void UpdateNodeTexts() => planGrid.RefreshValues();
 
-        static void ApplyExpansion(TreeNodeCollection collection)
-        {
-            foreach (TreeNode node in collection)
-            {
-                if (node.Nodes.Count > 0 && node.Tag is ITestStep step && ChildItemVisibility.GetVisibility(step) == ChildItemVisibility.Visibility.Visible)
-                    node.Expand();
-                ApplyExpansion(node.Nodes);
-            }
-        }
+        void SelectObject(object obj) => planGrid.SelectObjects(new[] { obj }, obj);
 
-        /// <summary> Updates names, enabled look and multi-selection highlight without rebuilding the tree. </summary>
-        void UpdateNodeTexts()
-        {
-            foreach (var pair in nodes)
-            {
-                var node = pair.Value;
-                string text;
-                if (pair.Key is TestPlan p)
-                {
-                    text = p.Name + (unsaved ? " *" : "");
-                    node.ToolTipText = p.Path ?? "Not saved yet";
-                }
-                else
-                {
-                    var step = (ITestStep)pair.Key;
-                    try { text = step.GetFormattedName(); }
-                    catch { text = step.Name; }
-                    node.ForeColor = step.Enabled ? Color.Empty : SystemColors.GrayText;
-                    node.BackColor = marked.Count > 1 && marked.Contains(step) ? Color.LightSteelBlue : Color.Empty;
-                    node.ToolTipText = TypeData.GetTypeData(step).GetDisplayAttribute()?.GetFullName();
-                }
-                if (node.Text != text) node.Text = text;
-            }
-        }
+        /// <summary> Selected steps in plan order. </summary>
+        List<ITestStep> SelectedSteps() => planGrid.SelectedObjects.OfType<ITestStep>().ToList();
 
-        void SelectObject(object obj)
-        {
-            if (obj != null && nodes.TryGetValue(obj, out var node))
-            {
-                if (tree.SelectedNode == node)
-                    ShowSelectionProperties();
-                else
-                    tree.SelectedNode = node;
-                node.EnsureVisible();
-            }
-        }
-
-        /// <summary> Selected steps in plan order: the Ctrl+click selection, or the single selected step. </summary>
-        List<ITestStep> SelectedSteps()
-        {
-            if (marked.Count > 0)
-                return plan.ChildTestSteps.RecursivelyGetAllTestSteps(TestStepSearch.All).Where(marked.Contains).ToList();
-            if (tree.SelectedNode?.Tag is ITestStep step)
-                return new List<ITestStep> { step };
-            return new List<ITestStep>();
-        }
-
-        /// <summary> Removes steps whose parent is also in the list (moving/deleting the parent covers them). </summary>
-        static List<ITestStep> TopLevelOnly(List<ITestStep> steps)
-        {
-            var set = new HashSet<ITestStep>(steps);
-            return steps.Where(s =>
-            {
-                for (var p = s.Parent as ITestStep; p != null; p = p.Parent as ITestStep)
-                    if (set.Contains(p)) return false;
-                return true;
-            }).ToList();
-        }
-
-        void OnTreeAfterSelect(object sender, TreeViewEventArgs e)
-        {
-            if (rebuilding) return;
-            if (!keepMarks && (ModifierKeys & Keys.Control) == 0)
-            {
-                marked.Clear();
-                if (e.Node?.Tag is ITestStep step) marked.Add(step);
-                UpdateNodeTexts();
-            }
-            ShowSelectionProperties();
-            UpdateCommandState();
-        }
-
-        void OnTreeNodeMouseClick(object sender, TreeNodeMouseClickEventArgs e)
-        {
-            if (e.Button == MouseButtons.Right)
-            {
-                // Keep a multi-selection when right-clicking one of its steps.
-                keepMarks = e.Node.Tag is ITestStep s && marked.Contains(s);
-                tree.SelectedNode = e.Node;
-                keepMarks = false;
-                return;
-            }
-            if (e.Button == MouseButtons.Left && (ModifierKeys & Keys.Control) != 0 && e.Node.Tag is ITestStep step)
-            {
-                if (!marked.Remove(step))
-                    marked.Add(step);
-                UpdateNodeTexts();
-                ShowSelectionProperties();
-                UpdateCommandState();
-            }
-        }
+        static List<ITestStep> TopLevelOnly(List<ITestStep> steps) => TestPlanGrid.TopLevelOnly(steps);
 
         void ShowSelectionProperties()
         {
@@ -543,28 +477,31 @@ namespace OpenTap.Gui
                 properties.LoadProperties(steps.ToArray());
             else if (steps.Count == 1)
                 properties.LoadProperties(steps[0]);
-            else if (tree.SelectedNode?.Tag is TestPlan)
+            else if (planGrid.CurrentObject is TestPlan)
                 properties.LoadProperties(plan);
             else
                 properties.LoadProperties(null);
+            if (pendingSelectMember != null)
+            {
+                properties.SelectMember(pendingSelectMember);
+                pendingSelectMember = null;
+            }
         }
 
-        void OnTreeKeyDown(object sender, KeyEventArgs e)
+        /// <summary> Keys handled while the test plan view has focus. </summary>
+        bool OnPlanKey(Keys keyData)
         {
-            bool handled = true;
-            if (e.KeyCode == Keys.Delete && !e.Modifiers.HasFlag(Keys.Shift)) { if (CanEdit()) DeleteSteps(); }
-            else if (e.Control && e.KeyCode == Keys.C) CopyStep();
-            else if (e.Control && e.KeyCode == Keys.X) { if (CanEdit()) CutStep(); }
-            else if (e.Control && e.KeyCode == Keys.V) { if (CanEdit()) PasteStep(); }
-            else if (e.Alt && e.KeyCode == Keys.Up) { if (CanEdit()) MoveSelected(-1); }
-            else if (e.Alt && e.KeyCode == Keys.Down) { if (CanEdit()) MoveSelected(1); }
-            else if (e.KeyCode == Keys.Space && e.Modifiers == Keys.None) { if (CanEdit()) ToggleEnabled(); }
-            else if (e.KeyCode == Keys.Enter) properties.Focus();
-            else handled = false;
-            if (handled)
+            switch (keyData)
             {
-                e.Handled = true;
-                e.SuppressKeyPress = true;
+                case Keys.Delete: if (CanEdit()) DeleteSteps(); return true;
+                case Keys.Control | Keys.C: CopyStep(); return true;
+                case Keys.Control | Keys.X: if (CanEdit()) CutStep(); return true;
+                case Keys.Control | Keys.V: if (CanEdit()) PasteStep(); return true;
+                case Keys.Alt | Keys.Up: if (CanEdit()) MoveSelected(-1); return true;
+                case Keys.Alt | Keys.Down: if (CanEdit()) MoveSelected(1); return true;
+                case Keys.Space: if (CanEdit()) ToggleEnabled(); return true;
+                case Keys.Enter: properties.Focus(); return true;
+                default: return false;
             }
         }
 
@@ -578,6 +515,290 @@ namespace OpenTap.Gui
 
         static bool AllowChild(ITestStepParent parent, ITestStep child) =>
             TestStepList.AllowChild(TypeData.GetTypeData(parent), TypeData.GetTypeData(child));
+
+        /// <summary> "Test Plan" title with the Columns drop-down and the Follow running step check box. </summary>
+        ToolStrip BuildPlanToolbar()
+        {
+            var bar = new ToolStrip { GripStyle = ToolStripGripStyle.Hidden, Dock = DockStyle.Top };
+            bar.Items.Add(new ToolStripLabel("Test Plan") { Font = new Font(Font, FontStyle.Bold) });
+
+            columnsButton = new ToolStripDropDownButton("Columns") { Alignment = ToolStripItemAlignment.Right, ToolTipText = "Choose the columns shown for each step" };
+            columnsButton.DropDown.Closing += (s, e) =>
+            {
+                // Keep the list open while ticking several columns.
+                if (e.CloseReason == ToolStripDropDownCloseReason.ItemClicked) e.Cancel = true;
+            };
+            columnsButton.DropDownOpening += (s, e) => BuildColumnsMenu();
+            columnsButton.DropDownItems.Add("...");
+
+            var follow = new CheckBox { Text = "Follow running step", Checked = planGrid.FollowRunningStep, AutoSize = true, BackColor = Color.Transparent, Padding = new Padding(4, 0, 0, 0) };
+            follow.CheckedChanged += (s, e) =>
+            {
+                planGrid.FollowRunningStep = follow.Checked;
+                GuiSettings.Current.FollowRunningStep = follow.Checked;
+                SaveGuiSettings();
+            };
+
+            bar.Items.Add(columnsButton);
+            bar.Items.Add(new ToolStripControlHost(follow) { Alignment = ToolStripItemAlignment.Right, ToolTipText = "Scroll so the running step is always visible" });
+            return bar;
+        }
+
+        void BuildColumnsMenu()
+        {
+            var items = columnsButton.DropDownItems;
+            items.Clear();
+            foreach (var column in TestPlanGrid.BuiltInColumns)
+            {
+                var key = column.Key;
+                var item = new ToolStripMenuItem(column.Header) { CheckOnClick = true, Checked = planGrid.ColumnKeys.Contains(key), ToolTipText = column.Description };
+                item.CheckedChanged += (s, e) => SetColumnVisible(key, item.Checked);
+                items.Add(item);
+            }
+            var memberColumns = planGrid.ColumnKeys.Where(TestPlanGrid.IsMemberColumn).ToList();
+            if (memberColumns.Any())
+            {
+                items.Add(new ToolStripSeparator());
+                foreach (var key in memberColumns)
+                {
+                    var item = new ToolStripMenuItem(planGrid.HeaderFor(key)) { CheckOnClick = true, Checked = true, ToolTipText = "Step setting. Untick to remove the column." };
+                    item.CheckedChanged += (s, e) => SetColumnVisible(key, item.Checked);
+                    items.Add(item);
+                }
+            }
+            items.Add(new ToolStripSeparator());
+            items.Add(new ToolStripMenuItem("Tip: right-click a step setting and choose \"Show as Column\"") { Enabled = false });
+        }
+
+        void SetColumnVisible(string key, bool visible)
+        {
+            // Keep the order the user arranged; new columns go at the end.
+            var keys = planGrid.ColumnOrder;
+            if (visible && !keys.Contains(key)) keys.Add(key);
+            if (!visible) keys.Remove(key);
+            planGrid.SetColumns(keys);
+            SaveColumnOrder();
+        }
+
+        void SaveColumnOrder()
+        {
+            GuiSettings.Current.TestPlanColumns = string.Join(",", planGrid.ColumnOrder);
+            SaveGuiSettings();
+        }
+
+        void RememberSettingsPaneWidth()
+        {
+            if (!layoutReady || topSplit.Width <= 0) return;
+            GuiSettings.Current.SettingsPanePercent = Math.Round(100.0 * (topSplit.Width - topSplit.SplitterDistance) / topSplit.Width, 1);
+            SaveGuiSettings();
+        }
+
+        #region Recent test plans
+
+        ToolStripMenuItem recentMenu;
+        const int RecentCount = 5;
+
+        static List<string> RecentPlans() =>
+            (GuiSettings.Current.RecentPlans ?? "").Split('|', StringSplitOptions.RemoveEmptyEntries).ToList();
+
+        static void AddRecentPlan(string path)
+        {
+            if (string.IsNullOrWhiteSpace(path)) return;
+            try { path = Path.GetFullPath(path); } catch { }
+            var list = RecentPlans();
+            list.RemoveAll(p => string.Equals(p, path, StringComparison.OrdinalIgnoreCase));
+            list.Insert(0, path);
+            GuiSettings.Current.RecentPlans = string.Join("|", list.Take(RecentCount));
+            SaveGuiSettings();
+        }
+
+        void BuildRecentMenu()
+        {
+            recentMenu.DropDownItems.Clear();
+            var list = RecentPlans();
+            if (list.Count == 0)
+            {
+                recentMenu.DropDownItems.Add(new ToolStripMenuItem("(none yet)") { Enabled = false });
+                return;
+            }
+            for (int i = 0; i < list.Count; i++)
+            {
+                var path = list[i];
+                var item = new ToolStripMenuItem($"&{i + 1}  {Path.GetFileName(path)}") { ToolTipText = path, Enabled = !running };
+                item.ShortcutKeyDisplayString = Path.GetDirectoryName(path);
+                item.Click += (s, e) => OpenRecent(path);
+                recentMenu.DropDownItems.Add(item);
+            }
+        }
+
+        void OpenRecent(string path)
+        {
+            if (running) return;
+            if (!File.Exists(path))
+            {
+                if (MessageBox.Show(this, $"'{path}' no longer exists.\n\nRemove it from the list?", "Recent Test Plans", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes)
+                {
+                    GuiSettings.Current.RecentPlans = string.Join("|", RecentPlans().Where(p => !string.Equals(p, path, StringComparison.OrdinalIgnoreCase)));
+                    SaveGuiSettings();
+                }
+                return;
+            }
+            if (!ConfirmDiscard()) return;
+            LoadPlanFile(path);
+        }
+
+        #endregion
+
+        #region Breakpoints
+
+        void ToggleBreakpoint()
+        {
+            var steps = SelectedSteps();
+            if (steps.Count == 0) return;
+            lock (breakpoints)
+            {
+                // If any selected step has no breakpoint, set them all; otherwise clear them all.
+                bool set = steps.Any(s => !breakpoints.Contains(s.Id));
+                foreach (var step in steps)
+                    if (set) breakpoints.Add(step.Id); else breakpoints.Remove(step.Id);
+            }
+            planGrid.Invalidate();
+            UpdateCommandState();
+        }
+
+        void ClearBreakpoints()
+        {
+            lock (breakpoints) breakpoints.Clear();
+            planGrid.Invalidate();
+            UpdateCommandState();
+        }
+
+        /// <summary> Called on the test plan thread as each step is about to start; blocks while paused at a breakpoint. </summary>
+        void OnBreakOffered(object sender, BreakOfferedEventArgs e)
+        {
+            if (!e.IsTestStepStarting || e.TestStepRun == null) return;
+            bool hit;
+            lock (breakpoints) hit = breakpoints.Contains(e.TestStepRun.TestStepId);
+            if (!hit) return;
+
+            resumeRun.Reset();
+            var id = e.TestStepRun.TestStepId;
+            OnUi(() => EnterPause(id));
+            GuiAction.Log.Info("Paused at breakpoint before '{0}'. Press F5 (Continue) to resume.",
+                stepsById.TryGetValue(id, out var s) ? s.GetFormattedName() : id.ToString());
+            System.Threading.WaitHandle.WaitAny(new[] { resumeRun.WaitHandle, TapThread.Current.AbortToken.WaitHandle });
+            OnUi(LeavePause);
+        }
+
+        void EnterPause(Guid stepId)
+        {
+            paused = true;
+            stepsById.TryGetValue(stepId, out var step);
+            pausedStepName = step?.GetFormattedName() ?? "?";
+            planGrid.SetPaused(step);
+            statusRun.ForeColor = Color.FromArgb(200, 90, 0);
+            statusRun.Text = $"Paused at breakpoint: {pausedStepName}  -  F5 to continue";
+            UpdateCommandState();
+            if (step != null) planGrid.SelectObjects(new[] { step }, step);
+        }
+
+        void LeavePause()
+        {
+            paused = false;
+            planGrid.SetPaused(null);
+            statusRun.ForeColor = SystemColors.ControlText;
+            UpdateCommandState();
+        }
+
+        void ContinueRun()
+        {
+            if (paused) resumeRun.Set();
+        }
+
+        #endregion
+
+        static void SaveGuiSettings()
+        {
+            try { GuiSettings.Current.Save(); }
+            catch (Exception ex) { GuiAction.Log.Debug(ex); }
+        }
+
+        /// <summary>
+        /// Right-click on a step setting: "Jump to Source" when the value comes from another step's output, and
+        /// show it as a test plan column (or remove that column).
+        /// </summary>
+        IEnumerable<ToolStripItem> PropertyMenuItems(AnnotationPropertyDescriptor descriptor)
+        {
+            var member = descriptor.Annotation.Get<IMemberAnnotation>()?.Member;
+            var firstStep = properties.Source as ITestStep ?? (properties.Source as ITestStep[])?.FirstOrDefault();
+            if (member == null || firstStep == null || TypeData.GetTypeData(firstStep).GetMember(member.Name) == null)
+                yield break;
+
+            if (properties.Source is ITestStep step)
+            {
+                var source = OutputSourceOf(step, member, descriptor.Annotation);
+                if (source != null)
+                {
+                    var (sourceStep, sourceMember) = source.Value;
+                    var stepName = sourceStep is ITestStep ss ? ss.GetFormattedName() : "Test Plan";
+                    var outputName = sourceMember?.GetDisplayAttribute()?.Name ?? sourceMember?.Name;
+                    var jump = new ToolStripMenuItem($"Jump to Source: {stepName}{(outputName != null ? " \u2192 " + outputName : "")}")
+                    {
+                        Font = new Font(Font, FontStyle.Bold)
+                    };
+                    jump.Click += (s, e) => JumpTo(sourceStep, sourceMember?.Name);
+                    yield return jump;
+                    yield return new ToolStripSeparator();
+                }
+            }
+
+            var key = TestPlanGrid.MemberPrefix + member.Name;
+            bool shown = planGrid.ColumnKeys.Contains(key);
+            var name = member.GetDisplayAttribute()?.Name ?? member.Name;
+            var item = new ToolStripMenuItem(shown ? $"Remove '{name}' Column from Test Plan" : $"Show '{name}' as Column in Test Plan");
+            item.Click += (s, e) => SetColumnVisible(key, !shown);
+            yield return item;
+        }
+
+        /// <summary> Where a setting gets its value: an assigned output (Assign Output) or an Input&lt;T&gt; setting's step. </summary>
+        static (ITestStepParent Step, IMemberData Member)? OutputSourceOf(ITestStep step, IMemberData member, AnnotationCollection annotation)
+        {
+            try
+            {
+                var relation = InputOutputRelation.GetRelations(step).FirstOrDefault(r => ReferenceEquals(r.InputObject, step) && r.InputMember?.Name == member.Name);
+                if (relation?.OutputObject != null)
+                    return (relation.OutputObject, relation.OutputMember);
+            }
+            catch (Exception ex)
+            {
+                GuiAction.Log.Debug(ex);
+            }
+            if (annotation.Get<IObjectValueAnnotation>()?.Value is IInput input && input.Step != null)
+                return (input.Step, input.Property);
+            return null;
+        }
+
+        /// <summary> Shows and selects a step (expanding its parents) and then selects one of its settings. </summary>
+        void JumpTo(ITestStepParent target, string memberName)
+        {
+            for (var p = (target as ITestStep)?.Parent as ITestStep; p != null; p = p.Parent as ITestStep)
+                ChildItemVisibility.SetVisibility(p, ChildItemVisibility.Visibility.Visible);
+            pendingSelectMember = memberName;
+            planGrid.Rebuild(plan, new object[] { target }, target);
+        }
+
+        void OnUi(Action action)
+        {
+            try
+            {
+                if (!IsDisposed && IsHandleCreated)
+                    BeginInvoke(action);
+            }
+            catch (InvalidOperationException)
+            {
+                // Window closed.
+            }
+        }
 
         #endregion
 
@@ -594,14 +815,14 @@ namespace OpenTap.Gui
         {
             Text = $"{plan.Name}{(unsaved ? " *" : "")} - OpenTAP GUI";
             statusPath.Text = plan.Path ?? "Not saved yet";
-            if (nodes.TryGetValue(plan, out var root))
-                root.Text = plan.Name + (unsaved ? " *" : "");
+            if (planGrid.RowCount > 0)
+                planGrid.InvalidateRow(0);
         }
 
         void InsertStep(bool asChild)
         {
             if (!CanEdit()) return;
-            var selected = tree.SelectedNode?.Tag;
+            var selected = planGrid.CurrentObject;
             ITestStepParent parent;
             int index;
             if (asChild)
@@ -641,9 +862,9 @@ namespace OpenTap.Gui
             }
         }
 
-        void DeleteSteps(bool confirm)
+        void DeleteSteps(bool confirm, List<ITestStep> toDelete = null)
         {
-            var steps = TopLevelOnly(SelectedSteps());
+            var steps = TopLevelOnly(toDelete ?? SelectedSteps());
             if (steps.Count == 0) return;
             if (confirm)
             {
@@ -658,7 +879,6 @@ namespace OpenTap.Gui
 
             foreach (var step in steps)
                 step.Parent?.ChildTestSteps.Remove(step);
-            marked.Clear();
             MarkChanged();
             RebuildTree(next);
         }
@@ -667,7 +887,7 @@ namespace OpenTap.Gui
 
         void CopyStep()
         {
-            if (tree.SelectedNode?.Tag is not ITestStep step) return;
+            if (planGrid.CurrentObject is not ITestStep step) return;
             try
             {
                 Clipboard.SetText(new TapSerializer().SerializeToString(step));
@@ -681,11 +901,9 @@ namespace OpenTap.Gui
 
         void CutStep()
         {
-            if (tree.SelectedNode?.Tag is not ITestStep step) return;
+            if (planGrid.CurrentObject is not ITestStep step) return;
             CopyStep();
-            marked.Clear();
-            marked.Add(step);
-            DeleteSteps(false);
+            DeleteSteps(false, new List<ITestStep> { step });
         }
 
         void PasteStep()
@@ -716,7 +934,7 @@ namespace OpenTap.Gui
 
             ITestStepParent parent;
             int index;
-            if (tree.SelectedNode?.Tag is ITestStep target)
+            if (planGrid.CurrentObject is ITestStep target)
             {
                 parent = target.Parent;
                 index = parent.ChildTestSteps.IndexOf(target) + 1;
@@ -738,7 +956,7 @@ namespace OpenTap.Gui
 
         void MoveSelected(int offset)
         {
-            if (tree.SelectedNode?.Tag is not ITestStep step) return;
+            if (planGrid.CurrentObject is not ITestStep step) return;
             var list = step.Parent.ChildTestSteps;
             var index = list.IndexOf(step);
             var target = index + offset;
@@ -764,75 +982,6 @@ namespace OpenTap.Gui
         #endregion
 
         #region Drag and drop
-
-        class StepDrag
-        {
-            public List<ITestStep> Steps;
-        }
-
-        void OnTreeItemDrag(object sender, ItemDragEventArgs e)
-        {
-            if (!CanEdit() || e.Item is not TreeNode node || node.Tag is not ITestStep step) return;
-            var steps = SelectedSteps();
-            if (!steps.Contains(step))
-                steps = new List<ITestStep> { step };
-            DoDragDrop(new StepDrag { Steps = TopLevelOnly(steps) }, DragDropEffects.Move);
-            ClearDropHighlight();
-        }
-
-        void OnTreeDragOver(object sender, DragEventArgs e)
-        {
-            if (IsPlanFileDrop(e.Data))
-            {
-                e.Effect = DragDropEffects.Copy;
-                return;
-            }
-            var drag = e.Data.GetData(typeof(StepDrag)) as StepDrag;
-            if (drag == null)
-            {
-                e.Effect = DragDropEffects.None;
-                return;
-            }
-
-            var point = tree.PointToClient(new Point(e.X, e.Y));
-            AutoScrollTree(point);
-            var target = GetDropTarget(point);
-            if (target != null && !IsValidDrop(drag.Steps, target.Value.Parent))
-                target = null;
-            e.Effect = target == null ? DragDropEffects.None : DragDropEffects.Move;
-            ShowDropHighlight(target);
-        }
-
-        void OnTreeDragDrop(object sender, DragEventArgs e)
-        {
-            if (IsPlanFileDrop(e.Data))
-            {
-                OpenDroppedFile(e.Data);
-                return;
-            }
-            var drag = e.Data.GetData(typeof(StepDrag)) as StepDrag;
-            var target = GetDropTarget(tree.PointToClient(new Point(e.X, e.Y)));
-            ClearDropHighlight();
-            if (drag == null || target == null || !IsValidDrop(drag.Steps, target.Value.Parent)) return;
-            MoveSteps(drag.Steps, target.Value.Parent, target.Value.Index);
-        }
-
-        (ITestStepParent Parent, int Index, TreeNode Node, DropPosition Position)? GetDropTarget(Point point)
-        {
-            var node = tree.GetNodeAt(point);
-            if (node == null || node.Tag is TestPlan)
-                return (plan, plan.ChildTestSteps.Count, node, DropPosition.Into);
-            var step = (ITestStep)node.Tag;
-            var index = step.Parent.ChildTestSteps.IndexOf(step);
-            var relative = (point.Y - node.Bounds.Top) / (double)Math.Max(1, node.Bounds.Height);
-            if (relative < 0.25)
-                return (step.Parent, index, node, DropPosition.Before);
-            if (relative > 0.75 && !(node.IsExpanded && node.Nodes.Count > 0))
-                return (step.Parent, index + 1, node, DropPosition.After);
-            if (CanHaveChildren(step))
-                return (step, step.ChildTestSteps.Count, node, DropPosition.Into);
-            return relative < 0.5 ? (step.Parent, index, node, DropPosition.Before) : (step.Parent, index + 1, node, DropPosition.After);
-        }
 
         static bool IsValidDrop(List<ITestStep> steps, ITestStepParent parent)
         {
@@ -860,58 +1009,7 @@ namespace OpenTap.Gui
                 ChildItemVisibility.SetVisibility(parentStep, ChildItemVisibility.Visibility.Visible);
 
             MarkChanged();
-            marked.Clear();
-            RebuildTree(steps[0]);
-            if (steps.Count > 1)
-            {
-                foreach (var s in steps) marked.Add(s);
-                UpdateNodeTexts();
-                ShowSelectionProperties();
-            }
-        }
-
-        void ShowDropHighlight((ITestStepParent Parent, int Index, TreeNode Node, DropPosition Position)? target)
-        {
-            if (dropTarget?.Node == target?.Node && dropTarget?.Position == target?.Position) return;
-            ClearDropHighlight();
-            dropTarget = target;
-            if (target?.Node == null) return;
-            var node = target.Value.Node;
-            if (target.Value.Position == DropPosition.Into)
-            {
-                dropHighlight = node;
-                node.BackColor = Color.LightSkyBlue;
-            }
-            else
-            {
-                tree.Update();
-                using var g = tree.CreateGraphics();
-                var y = target.Value.Position == DropPosition.Before ? node.Bounds.Top : node.Bounds.Bottom - 1;
-                using var pen = new Pen(SystemColors.Highlight, 2);
-                g.DrawLine(pen, node.Bounds.Left, y, tree.ClientSize.Width, y);
-            }
-        }
-
-        void ClearDropHighlight()
-        {
-            if (dropHighlight != null)
-            {
-                dropHighlight.BackColor = dropHighlight.Tag is ITestStep s && marked.Count > 1 && marked.Contains(s) ? Color.LightSteelBlue : Color.Empty;
-                dropHighlight = null;
-            }
-            if (dropTarget != null)
-                tree.Invalidate();
-            dropTarget = null;
-        }
-
-        void AutoScrollTree(Point point)
-        {
-            var node = tree.GetNodeAt(point);
-            if (node == null) return;
-            if (point.Y < tree.ItemHeight && node.PrevVisibleNode != null)
-                node.PrevVisibleNode.EnsureVisible();
-            else if (point.Y > tree.ClientSize.Height - tree.ItemHeight && node.NextVisibleNode != null)
-                node.NextVisibleNode.EnsureVisible();
+            planGrid.Rebuild(plan, steps.Cast<object>(), steps[0]);
         }
 
         static bool IsPlanFileDrop(IDataObject data) =>
@@ -974,12 +1072,123 @@ namespace OpenTap.Gui
         {
             plan = newPlan;
             unsaved = isUnsaved;
-            marked.Clear();
-            RebuildTree(plan);
+            planGrid.Rebuild(plan, new object[] { plan }, plan);
             UpdateTitle();
             if (isUnsaved) recovery.Save(plan);
             else recovery.Remove();
+            NotifyPanels(plan: true);
         }
+
+        #region Editor panels
+
+        /// <summary> View > Panels: one item per editor panel plugin; ticked when open. </summary>
+        void BuildPanelsMenu()
+        {
+            panelsMenu.DropDownItems.Clear();
+            var available = PanelCatalog.AvailablePanels();
+            if (available.Count == 0)
+            {
+                panelsMenu.DropDownItems.Add(new ToolStripMenuItem("No panel plugins installed (they need the WPF Controls package)") { Enabled = false });
+                return;
+            }
+            foreach (var type in available)
+            {
+                var captured = type;
+                var item = new ToolStripMenuItem(PanelCatalog.NameOf(type))
+                {
+                    Checked = PanelIsOpen(type),
+                    ToolTipText = type.GetDisplayAttribute()?.Description
+                };
+                item.Click += (s, e) => TogglePanel(captured);
+                panelsMenu.DropDownItems.Add(item);
+            }
+            panelsMenu.DropDownItems.Add(new ToolStripSeparator());
+            panelsMenu.DropDownItems.Add(new ToolStripMenuItem("Tip: right-click or double-click a panel's tab to float it") { Enabled = false });
+        }
+
+        // The methods below touch Keysight's WPF panel types; they only run when panel plugins exist.
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        PanelHost Panels() => panels ??= new PanelHost(this, settingsTabs, SavePanelLayout);
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        bool PanelIsOpen(ITypeData type) => panels != null && panels.IsOpen(type);
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        void TogglePanel(ITypeData type)
+        {
+            try { Panels().Toggle(type); }
+            catch (Exception ex) { GuiAction.Log.Error("Panels are not available: {0}", ex.Message); GuiAction.Log.Debug(ex); }
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        void RestorePanels()
+        {
+            var layout = GuiSettings.Current.OpenPanels;
+            if (string.IsNullOrWhiteSpace(layout) || PanelCatalog.AvailablePanels().Count == 0) return;
+            try { Panels().RestoreLayout(layout); }
+            catch (Exception ex) { GuiAction.Log.Warning("Could not reopen panels: {0}", ex.Message); GuiAction.Log.Debug(ex); }
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        void NotifyPanels(bool plan = false, bool selection = false)
+        {
+            if (panels == null) return;
+            try
+            {
+                if (plan) panels.PlanChanged();
+                if (selection) panels.SelectionChanged();
+            }
+            catch (Exception ex) { GuiAction.Log.Debug(ex); }
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        IEnumerable<IResultListener> PanelResultListeners() =>
+            panels == null ? Enumerable.Empty<IResultListener>() : panels.ExtraResultListeners();
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        void ClosePanels()
+        {
+            panels?.CloseAll();
+        }
+
+        void SavePanelLayout()
+        {
+            if (panels == null) return;
+            GuiSettings.Current.OpenPanels = panels.Layout;
+            SaveGuiSettings();
+        }
+
+        // Called by panels through their context.
+
+        internal void SetPlanFromPanel(TestPlan newPlan)
+        {
+            if (newPlan == null || ReferenceEquals(newPlan, plan) || running) return;
+            if (!ConfirmDiscard()) return;
+            SetPlan(newPlan, false);
+            AddRecentPlan(newPlan.Path);
+        }
+
+        internal TapThread RunFromPanel()
+        {
+            if (!running) RunPlan(false);
+            return runThread;
+        }
+
+        internal IEnumerable<object> SelectedForPanels()
+        {
+            var steps = SelectedSteps();
+            return steps.Count > 0 ? steps.Cast<object>().ToList() : new List<object> { plan };
+        }
+
+        internal void SelectFromPanel(IEnumerable<object> items)
+        {
+            var list = items?.Where(i => i is ITestStep || i is TestPlan).ToList();
+            if (list == null || list.Count == 0) return;
+            planGrid.SelectObjects(list, list[0]);
+        }
+
+        #endregion
 
         bool ConfirmDiscard()
         {
@@ -1018,6 +1227,7 @@ namespace OpenTap.Gui
             {
                 Cursor = Cursors.WaitCursor;
                 SetPlan(TestPlan.Load(path), false);
+                AddRecentPlan(path);
                 GuiAction.Log.Info("Loaded test plan '{0}'.", path);
             }
             catch (Exception ex)
@@ -1054,6 +1264,7 @@ namespace OpenTap.Gui
                 unsaved = false;
                 UpdateTitle();
                 recovery.Remove();
+                AddRecentPlan(plan.Path);
                 GuiAction.Log.Info("Saved test plan to '{0}'.", plan.Path);
                 return true;
             }
@@ -1087,6 +1298,8 @@ namespace OpenTap.Gui
 
         protected override void OnFormClosed(FormClosedEventArgs e)
         {
+            RememberSettingsPaneWidth();
+            try { ClosePanels(); } catch (Exception ex) { GuiAction.Log.Debug(ex); }
             recovery.Remove();
             runTimer.Dispose();
             base.OnFormClosed(e);
@@ -1098,6 +1311,11 @@ namespace OpenTap.Gui
 
         void RunPlan(bool selectedOnly)
         {
+            if (paused && !selectedOnly)
+            {
+                ContinueRun();
+                return;
+            }
             if (running) return;
             HashSet<ITestStep> stepsOverride = null;
             if (selectedOnly)
@@ -1118,17 +1336,29 @@ namespace OpenTap.Gui
             UpdateCommandState();
 
             plan.PrintTestPlanRunSummary = true;
+            stepsById = new Dictionary<Guid, ITestStep>();
+            foreach (var step in plan.ChildTestSteps.RecursivelyGetAllTestSteps(TestStepSearch.All))
+                stepsById[step.Id] = step;
+            planGrid.BeginRun();
+            var listeners = ResultSettings.Current.Cast<IResultListener>().Append(runTracker).Concat(PanelResultListeners()).Distinct().ToList();
+            var runPlan = plan;
+            resumeRun.Set();
+            runPlan.BreakOffered += OnBreakOffered;
             runThread = TapThread.Start(() =>
             {
                 Verdict? verdict = null;
                 try
                 {
-                    verdict = plan.Execute(ResultSettings.Current, null, stepsOverride).Verdict;
+                    verdict = runPlan.Execute(listeners, null, stepsOverride).Verdict;
                 }
                 catch (Exception ex)
                 {
                     GuiAction.Log.Error("Test plan run failed: {0}", ex.Message);
                     GuiAction.Log.Debug(ex);
+                }
+                finally
+                {
+                    runPlan.BreakOffered -= OnBreakOffered;
                 }
                 try
                 {
@@ -1145,6 +1375,7 @@ namespace OpenTap.Gui
         void RunFinished(Verdict? verdict)
         {
             running = false;
+            if (paused) LeavePause();
             runTimer.Stop();
             var elapsed = DateTime.Now - runStart;
             statusRun.Text = verdict == null ? "Run failed" : $"Last run: {verdict}  ({elapsed:hh\\:mm\\:ss})";
@@ -1157,8 +1388,8 @@ namespace OpenTap.Gui
                 Verdict.Inconclusive => Color.DarkOrange,
                 _ => SystemColors.ControlText
             };
+            planGrid.EndRun(verdict);
             properties.ReloadValues();
-            UpdateNodeTexts();
             UpdateCommandState();
         }
 
