@@ -1,0 +1,50 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Windows Forms port of the OpenTAP TUI. It is an OpenTAP plugin (like the TUI), so it is
+       started with "tap gui" and runs inside tap.exe with every installed plugin available.
+       OpenTAP 9.33's tap.exe already runs on the Microsoft.WindowsDesktop.App 9.0 runtime,
+       so WinForms can load in-process. -->
+  <PropertyGroup>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>disable</Nullable>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+    <AssemblyName>OpenTap.Gui</AssemblyName>
+    <RootNamespace>OpenTap.Gui</RootNamespace>
+    <OpenTapVersion>9.33.0</OpenTapVersion>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <OpenTapPackageDefinitionPath>package.xml</OpenTapPackageDefinitionPath>
+    <CreateOpenTapPackage>false</CreateOpenTapPackage>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <CreateOpenTapPackage>true</CreateOpenTapPackage>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="OpenTAP" Version="$(OpenTapVersion)" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Package manager API. Part of every OpenTAP installation, so it is referenced but not copied. -->
+    <Reference Include="OpenTap.Package">
+      <HintPath>$(NuGetPackageRoot)opentap\$(OpenTapVersion)\build\runtimes\win-x64\OpenTap.Package.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <!-- ITableExport (results viewer export). Ships with the OpenTAP package itself. -->
+    <Reference Include="OpenTap.Plugins.BasicSteps">
+      <HintPath>$(NuGetPackageRoot)opentap\$(OpenTapVersion)\build\runtimes\win-x64\Packages\OpenTAP\OpenTap.Plugins.BasicSteps.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="..\doc\icon.png">
+      <Link>Packages/GUI/icon.png</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+</Project>

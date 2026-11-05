@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Package Name="GUI" xmlns="http://opentap.io/schemas/package" Version="0.1.0" OS="Windows" Tags="Editor">
+  <Description>
+Windows Forms port of the OpenTAP TUI. Create, edit and run OpenTAP test plans (.TapPlan) and edit
+bench settings from a standard Windows desktop window. Start it with "tap gui [plan]".
+  </Description>
+  <Files>
+    <File Path="Packages/GUI/OpenTap.Gui.dll" SourcePath="OpenTap.Gui.dll">
+      <SetAssemblyInfo Attributes="Version"/>
+    </File>
+    <File Path="Packages/GUI/icon.png">
+      <PackageIcon/>
+    </File>
+  </Files>
+</Package>
