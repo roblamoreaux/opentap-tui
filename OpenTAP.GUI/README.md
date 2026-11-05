@@ -1,4 +1,6 @@
-﻿# OpenTAP GUI (Windows Forms port of the TUI)
+# OpenTAP GUI (Windows Forms port of the TUI)
+
+Ported from the OpenTAP TUI by **Claude** (Anthropic's AI assistant).
 
 A Windows desktop version of the OpenTAP TUI in this repository. Like the TUI it is an OpenTAP plugin,
 so it runs inside `tap.exe` with every installed plugin, instrument and setting available:
@@ -13,6 +15,8 @@ When started from a shortcut or Explorer, the console window `tap.exe` opens is 
 when typed into a terminal, the terminal is left alone (and still shows the log).
 
 Requires OpenTAP 9.33 (its `tap.exe` runs on the .NET 9 Windows Desktop runtime, which WinForms needs).
+
+For a user guide with a step-by-step tutorial, see the [User Manual & Tutorial](../doc/gui/Manual.md).
 
 ## Build
 
@@ -30,15 +34,15 @@ that can be installed into a bench with `tap package install`.
 |---|---|
 | `MainWindow` / `TUI` action | `MainForm` / `GuiAction` (`tap gui`) |
 | `TestPlanView` (tree, move-selection mode, copy/paste) | Tree on the left: context menu, drag and drop, Ctrl+click multi-select, Cut/Copy/Paste, Move Up/Down, Space to enable/disable |
-| `PropertiesView` + `PropEditProviders/*` | `AnnotationPropertyGrid`: standard Windows PropertyGrid driven by OpenTAP annotations (drop-downs, multi-select, Enabled&lt;T&gt;, file/folder browse, secure strings, actions, right-click Parameterize/Assign Output, validation âš ) |
+| `PropertiesView` + `PropEditProviders/*` | `AnnotationPropertyGrid`: standard Windows PropertyGrid driven by OpenTAP annotations (drop-downs, multi-select, Enabled&lt;T&gt;, file/folder browse, secure strings, actions, right-click Parameterize/Assign Output, validation ⚠) |
 | `DataGridEditProvider` | `CollectionEditorForm` (table editor for list properties) |
 | `NewPluginWindow` | `AddPluginDialog` (grouped, searchable) |
 | `ComponentSettingsWindow`, `ResourceSettingsWindow`, `ConnectionSettingsWindow` | `ComponentSettingsForm`, `ListSettingsForm` (Bench / Settings menus) |
-| `SettingsProfileWindow` | `ProfilesForm` (Bench â†’ Profiles) |
+| `SettingsProfileWindow` | `ProfilesForm` (Bench → Profiles) |
 | `TuiUserInput` | `GuiUserInput` (dialog steps, plan-load questions, ...) |
 | `LogPanelView` | `LogView` (colored by level, copy, clear) |
 | `Recovery` | `Recovery` (offers to recover unsaved plans after a crash) |
-| `TuiSettings` (log panel options) | `GuiSettings` (Settings â†’ GUI Settings) |
+| `TuiSettings` (log panel options) | `GuiSettings` (Settings → GUI Settings) |
 | `TuiPm`, `PackageManagerWindow`, `PackageListView`, `PackageDetailsView` | `gui-pm`, `PackageManagerForm` (searchable package list from the repositories in Package Manager settings, details, log) |
 | `PackageVersionSelectorWindow` | `PackageVersionsForm` (pick a version, Install / Uninstall with progress and Cancel) |
 | `TuiResults`, `ResultsViewerWindow` (RunExplorerWindow.cs) | `gui-results`, `ResultsViewerForm` (runs from the result stores in Results settings, check runs to plot) |
@@ -53,7 +57,7 @@ New in the GUI (not in the TUI):
   setting of a step in the Settings pane and choose **Show as Column in Test Plan** to add it as a column.
   Column choices are remembered (GUI Settings). Live run information comes from `GuiRunTracker`, a hidden result
   listener added to runs started from the GUI.
-- **Editor panels** (`Panels.cs`): View â†’ Panels lists every panel plugin (anything implementing Keysight's
+- **Editor panels** (`Panels.cs`): View → Panels lists every panel plugin (anything implementing Keysight's
   `ITapDockPanel` from the "WPF Controls" package: Operator Panel, Live Results, Documentation, AI Assist, ...). The Keysight Editor's own window parts (Test Plan, Test Steps, Test Step Settings, Test Plan Settings, Log, Welcome) are left out: they only work inside the Editor and the GUI has its own versions.
   A panel opens as a tab next to Settings; double-click or right-click its tab to float it in its own window,
   and use "Dock next to Settings" to put it back. Open panels and their docked/floating state come back on the
@@ -63,16 +67,16 @@ New in the GUI (not in the TUI):
   Documentation and Live Results 2 on OpenTAP 9.35.1; without "WPF Controls" the menu just says no panels are
   installed. `Keysight.OpenTap.Wpf.dll` is referenced from the OpenTAP installation, not shipped
   (`WpfControlsPath` in the project file).
-- **Breakpoints**: F9, Run â†’ Toggle Breakpoint or right-click a step. A red dot next to the step number marks
-  it. The run pauses just before the step starts (row shown in orange, status bar says where); F5 / â–¶ Continue
+- **Breakpoints**: F9, Run → Toggle Breakpoint or right-click a step. A red dot next to the step number marks
+  it. The run pauses just before the step starts (row shown in orange, status bar says where); F5 / ▶ Continue
   resumes, Abort stops. Uses OpenTAP's `TestPlan.BreakOffered`. Breakpoints are kept for the session (by step
   ID), not saved in the plan file.
-- **File â†’ Recent Test Plans**: the last 5 plans opened or saved.
+- **File → Recent Test Plans**: the last 5 plans opened or saved.
 - The Settings pane width and the test plan column order (drag column headers) are remembered (GUI Settings).
 - **Jump to Source**: right-click a setting whose value comes from another step's output (Assign Output, or an
   input such as the If step's) to select that step and its output.
 - **Log panel** (`LogPanel`): Error / Warning / Information / Debug check boxes, a Sources drop-down, a Filter box
-  (only show matching lines), a Find box with â–²/â–¼ (highlights matches; finding turns Auto scroll off so the match
+  (only show matching lines), a Find box with ▲/▼ (highlights matches; finding turns Auto scroll off so the match
   stays in view) and an Auto scroll check box. Also used in the package manager.
 - The results viewer's **Step Results** grid (`StepResultsGrid`). Select one or
 more runs to list every step with its verdict, result values, Min/Max limits and Check Limits. The limits come
