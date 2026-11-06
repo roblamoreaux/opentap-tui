@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.ComponentModel;
 using System.Drawing;
 using System.Globalization;
+using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -40,9 +41,22 @@ namespace OpenTap.Gui
         readonly ToolStripButton plotButton;
         readonly StepResultsGrid stepGrid;
         readonly Label stepTitle;
+        readonly ToolStripComboBox sourceBox;
         bool stepGridUpdateQueued;
         List<RunInfo> runs = new List<RunInfo>();
-        bool loading;
+        bool loading, reloadPending;
+
+        /// <summary> An entry of the Database drop-down. Key: "" = all result stores, "store:Name", "file:path" or "open". </summary>
+        class SourceItem
+        {
+            public string Key;
+            public string Text;
+            public override string ToString() => Text;
+        }
+        SourceItem currentSource;
+        bool fillingSources;
+        const string SqliteTypeName = "Keysight.OpenTap.Plugins.ResultListeners.SQLiteDatabase";
+        const int RecentFileCount = 5;
 
         public ResultsViewerForm()
         {
@@ -75,13 +89,21 @@ namespace OpenTap.Gui
             {
                 using (var form = new ListSettingsForm("Results", ResultSettings.Current))
                     form.ShowDialog(this);
+                FillSources();
                 LoadRuns();
             };
             var selectAll = new ToolStripButton("Check All");
             selectAll.Click += (s, e) => { foreach (ListViewItem i in list.Items) i.Checked = true; };
             var selectNone = new ToolStripButton("Uncheck All");
             selectNone.Click += (s, e) => { foreach (ListViewItem i in list.Items) i.Checked = false; };
-            toolbar.Items.AddRange(new ToolStripItem[] { plotButton, new ToolStripSeparator(), selectAll, selectNone, new ToolStripSeparator(), refresh, resultSettings });
+            sourceBox = new ToolStripComboBox
+            {
+                DropDownStyle = ComboBoxStyle.DropDownList, AutoSize = false, Width = 300, DropDownWidth = 520,
+                ToolTipText = "The result database to read: the result stores in Result Settings (for example PostgreSQL) or a .TapResults file"
+            };
+            sourceBox.SelectedIndexChanged += (s, e) => SourceChanged();
+            toolbar.Items.AddRange(new ToolStripItem[] { new ToolStripLabel("Database:"), sourceBox, new ToolStripSeparator(),
+                plotButton, new ToolStripSeparator(), selectAll, selectNone, new ToolStripSeparator(), refresh, resultSettings });
 
             var statusStrip = new StatusStrip();
             status = new ToolStripStatusLabel { Spring = true, TextAlign = ContentAlignment.MiddleLeft };
@@ -110,7 +132,132 @@ namespace OpenTap.Gui
 
             KeyPreview = true;
             KeyDown += (s, e) => { if (e.KeyCode == Keys.F5) { PlotChecked(); e.Handled = true; } };
-            Load += (s, e) => LoadRuns();
+            Load += (s, e) =>
+            {
+                FillSources();
+                LoadRuns();
+            };
+        }
+
+        /// <summary> Fills the Database drop-down: all stores, each configured store, recent files and "Open...". </summary>
+        void FillSources()
+        {
+            var key = currentSource?.Key ?? GuiSettings.Current.ResultsSource ?? "";
+            var items = new List<SourceItem> { new SourceItem { Key = "", Text = "All result stores (Result Settings)" } };
+            foreach (var store in ResultSettings.Current.OfType<IResultStore>())
+            {
+                var typeName = TypeData.GetTypeData(store).GetDisplayAttribute().Name;
+                items.Add(new SourceItem { Key = "store:" + store.Name, Text = store.Name == typeName ? store.Name : $"{store.Name} ({typeName})" });
+            }
+            foreach (var path in RecentFiles())
+                items.Add(new SourceItem { Key = "file:" + path, Text = $"{Path.GetFileName(path)}  -  {Path.GetDirectoryName(path)}" });
+            items.Add(new SourceItem { Key = "open", Text = "Open TapResults file..." });
+
+            fillingSources = true;
+            sourceBox.Items.Clear();
+            sourceBox.Items.AddRange(items.ToArray());
+            currentSource = items.FirstOrDefault(i => i.Key == key && i.Key != "open") ?? items[0];
+            sourceBox.SelectedItem = currentSource;
+            fillingSources = false;
+        }
+
+        void SourceChanged()
+        {
+            if (fillingSources || sourceBox.SelectedItem is not SourceItem item || item == currentSource) return;
+            if (item.Key == "open")
+            {
+                // Close the list first and open the dialog afterwards, so the list cannot pick "Open..." again when it closes.
+                sourceBox.DroppedDown = false;
+                BeginInvoke(new Action(OpenFileSource));
+                return;
+            }
+            SetSource(item);
+        }
+
+        void OpenFileSource()
+        {
+            var path = BrowseForFile();
+            if (path == null)
+            {
+                fillingSources = true;
+                sourceBox.SelectedItem = currentSource;
+                fillingSources = false;
+                return;
+            }
+            var list = RecentFiles();
+            list.RemoveAll(p => string.Equals(p, path, StringComparison.OrdinalIgnoreCase));
+            list.Insert(0, path);
+            GuiSettings.Current.RecentResultFiles = string.Join("|", list.Take(RecentFileCount));
+            currentSource = new SourceItem { Key = "file:" + path };
+            FillSources();
+            SetSource(currentSource);
+        }
+
+        /// <summary> Reads the runs of the chosen Database entry and remembers it for next time. </summary>
+        void SetSource(SourceItem item)
+        {
+            currentSource = item;
+            GuiSettings.Current.ResultsSource = currentSource.Key;
+            try { GuiSettings.Current.Save(); }
+            catch (Exception ex) { GuiAction.Log.Debug(ex); }
+            LoadRuns();
+        }
+
+        string BrowseForFile()
+        {
+            if (TypeData.GetTypeData(SqliteTypeName) == null)
+            {
+                MessageBox.Show(this, "Opening result files needs the 'SQLite and PostgreSQL' package.", "Open Result File", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return null;
+            }
+            using var dialog = new OpenFileDialog
+            {
+                Title = "Open Result Database",
+                Filter = "TapResults files (*.TapResults)|*.TapResults|SQLite databases (*.db;*.sqlite;*.sqlite3)|*.db;*.sqlite;*.sqlite3|All files (*.*)|*.*",
+                CheckFileExists = true
+            };
+            var recent = RecentFiles().FirstOrDefault();
+            if (recent != null && Directory.Exists(Path.GetDirectoryName(recent)))
+                dialog.InitialDirectory = Path.GetDirectoryName(recent);
+            return dialog.ShowDialog(this) == DialogResult.OK ? dialog.FileName : null;
+        }
+
+        static List<string> RecentFiles() =>
+            (GuiSettings.Current.RecentResultFiles ?? "").Split('|', StringSplitOptions.RemoveEmptyEntries).ToList();
+
+        /// <summary> The result stores the selected Database entry stands for. </summary>
+        List<IResultStore> SelectedStores()
+        {
+            var key = currentSource?.Key ?? "";
+            var configured = ResultSettings.Current.OfType<IResultStore>().ToList();
+            if (key.StartsWith("store:"))
+                return configured.Where(s => s.Name == key.Substring(6)).Take(1).ToList();
+            if (key.StartsWith("file:"))
+            {
+                var store = CreateFileStore(key.Substring(5));
+                return store == null ? new List<IResultStore>() : new List<IResultStore> { store };
+            }
+            return configured;
+        }
+
+        /// <summary> A SQLite result store (from the "SQLite and PostgreSQL" package) reading the given file. </summary>
+        static IResultStore CreateFileStore(string path)
+        {
+            if (!File.Exists(path))
+            {
+                GuiAction.Log.Error("Result file not found: '{0}'.", path);
+                return null;
+            }
+            var type = TypeData.GetTypeData(SqliteTypeName);
+            if (type == null || !type.CanCreateInstance || type.CreateInstance() is not IResultStore store)
+            {
+                GuiAction.Log.Error("Opening result files needs the 'SQLite and PostgreSQL' package.");
+                return null;
+            }
+            var filePath = type.GetMember("FilePath");
+            filePath.SetValue(store, filePath.TypeDescriptor.DescendsTo(typeof(MacroString)) ? new MacroString { Text = path } : path);
+            type.GetMember("Name")?.SetValue(store, Path.GetFileName(path));
+            return store;
         }
 
         void UpdateButtons() => plotButton.Enabled = list.CheckedItems.Count > 0;
@@ -130,24 +277,50 @@ namespace OpenTap.Gui
 
         void LoadRuns()
         {
-            if (loading) return;
+            if (loading)
+            {
+                // Another database was chosen while reading: read again when the current read is done.
+                reloadPending = true;
+                return;
+            }
             loading = true;
             list.Items.Clear();
             UpdateButtons();
             status.Text = "Loading runs...";
+            var errors = new List<string>();
+            var stores = SelectedStores();
+            if (stores.Count == 0 && (currentSource?.Key ?? "").StartsWith("file:"))
+                errors.Add($"Could not open '{currentSource.Key.Substring(5)}'. The file is missing, or the 'SQLite and PostgreSQL' package is not installed.");
             Task.Run(() =>
             {
                 var result = new List<RunInfo>();
-                var stores = ResultSettings.Current.OfType<IResultStore>().ToList();
-                foreach (var store in stores)
-                    result.AddRange(ReadStore(store));
+                // Result stores report problems such as a failed database login in the log instead of throwing; collect them.
+                var collector = new ErrorCollector(stores.SelectMany(s => new[] { s.Name, TypeData.GetTypeData(s).GetDisplayAttribute().Name }));
+                Log.AddListener(collector);
+                try
+                {
+                    foreach (var store in stores)
+                        result.AddRange(ReadStore(store, errors));
+                    Log.Flush();
+                }
+                finally
+                {
+                    Log.RemoveListener(collector);
+                }
+                lock (collector.Errors) errors.AddRange(collector.Errors);
                 try
                 {
                     BeginInvoke(new Action(() =>
                     {
                         loading = false;
+                        if (reloadPending)
+                        {
+                            reloadPending = false;
+                            LoadRuns();
+                            return;
+                        }
                         runs = result;
-                        Fill(stores.Count);
+                        Fill(stores.Count, errors);
                     }));
                 }
                 catch (InvalidOperationException)
@@ -161,7 +334,7 @@ namespace OpenTap.Gui
         /// Same traversal as the TUI (plan runs, plus every result table attached to its top-most plan run),
         /// and additionally keeps the step runs for the step results grid.
         /// </summary>
-        static List<RunInfo> ReadStore(IResultStore store)
+        static List<RunInfo> ReadStore(IResultStore store, List<string> errors)
         {
             var runs = new Dictionary<long, RunInfo>();
             RunInfo PlanRunOf(IData entry)
@@ -206,6 +379,7 @@ namespace OpenTap.Gui
             {
                 GuiAction.Log.Error("Could not read results from '{0}': {1}", store.Name, ex.Message);
                 GuiAction.Log.Debug(ex);
+                errors.Add($"{store.Name}: {ex.Message}");
             }
             finally
             {
@@ -214,7 +388,24 @@ namespace OpenTap.Gui
             return runs.Values.ToList();
         }
 
-        void Fill(int storeCount)
+        /// <summary> Collects error messages logged by the given log sources (the result stores being read). </summary>
+        class ErrorCollector : OpenTap.Diagnostic.ILogListener
+        {
+            readonly HashSet<string> sources;
+            public readonly List<string> Errors = new List<string>();
+            public ErrorCollector(IEnumerable<string> sources) => this.sources = new HashSet<string>(sources.Where(s => s != null));
+
+            public void EventsLogged(IEnumerable<OpenTap.Diagnostic.Event> events)
+            {
+                foreach (var e in events)
+                    if (e.EventType == (int)LogEventType.Error && sources.Contains(e.Source))
+                        lock (Errors) Errors.Add($"{e.Source}: {e.Message}");
+            }
+
+            public void Flush() { }
+        }
+
+        void Fill(int storeCount, List<string> errors)
         {
             list.BeginUpdate();
             list.Items.Clear();
@@ -231,9 +422,24 @@ namespace OpenTap.Gui
                 list.Items.Add(item);
             }
             list.EndUpdate();
-            status.Text = storeCount == 0
-                ? "No result stores are configured. Add one (for example SQLite) with Result Settings."
-                : $"{runs.Count} run(s) from {storeCount} result store(s). Select a run to see its steps; check runs and press Plot Results to plot.";
+            var key = currentSource?.Key ?? "";
+            var from = key.StartsWith("file:") ? Path.GetFileName(key.Substring(5))
+                : key.StartsWith("store:") ? key.Substring(6)
+                : $"{storeCount} result store(s)";
+            if (errors.Count > 0)
+            {
+                status.Text = $"{runs.Count} run(s). Could not read {from} - {errors[0].Replace("\r", " ").Replace("\n", " ")}";
+                status.ForeColor = Color.DarkRed;
+                status.ToolTipText = string.Join(Environment.NewLine, errors.Distinct());
+            }
+            else
+            {
+                status.Text = storeCount == 0
+                    ? "No result stores are configured. Add one (for example SQLite) with Result Settings, or open a TapResults file under Database."
+                    : $"{runs.Count} run(s) from {from}. Select a run to see its steps; check runs and press Plot Results to plot.";
+                status.ForeColor = SystemColors.ControlText;
+                status.ToolTipText = null;
+            }
             UpdateButtons();
         }
 

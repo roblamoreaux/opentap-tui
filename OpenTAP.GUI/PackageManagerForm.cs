@@ -148,6 +148,70 @@ namespace OpenTap.Gui
             return result.OrderByDescending(p => p.Version).ToList();
         }
 
+        /// <summary>
+        /// Newest release (non pre-release) version of each of the given packages that is available for this OS/architecture,
+        /// like the "update available" note of "tap package list".
+        /// </summary>
+        public static Dictionary<string, SemanticVersion> GetLatestReleases(List<PackageDef> installed, PackageDef installedOpenTap, CancellationToken cancel)
+        {
+            var latest = new Dictionary<string, SemanticVersion>();
+            void Add(string name, SemanticVersion version)
+            {
+                if (version == null || !string.IsNullOrEmpty(version.PreRelease)) return;
+                if (!latest.TryGetValue(name, out var current) || version.CompareTo(current) > 0)
+                    latest[name] = version;
+            }
+            var names = installed.Select(p => p.Name).Distinct().ToList();
+            foreach (var repository in EnabledRepositories())
+            {
+                if (cancel.IsCancellationRequested) break;
+                try
+                {
+                    if (repository.Manager is HttpPackageRepository http)
+                    {
+                        // The repository does not accept aliased queries, so ask for each package separately, a few at a time.
+                        var errors = 0;
+                        Parallel.ForEach(names, new ParallelOptions { MaxDegreeOfParallelism = 4, CancellationToken = cancel }, name =>
+                        {
+                            try
+                            {
+                                var root = QueryRoot(http, $"packages(name: \"{Escape(name)}\", os: \"{Escape(installedOpenTap.OS)}\", architecture: \"{installedOpenTap.Architecture}\") {{ version }}");
+                                if (!root.TryGetProperty("packages", out var versions) || versions.ValueKind != JsonValueKind.Array) return;
+                                foreach (var v in versions.EnumerateArray())
+                                    if (v.TryGetProperty("version", out var s) && SemanticVersion.TryParse(s.GetString(), out var version))
+                                        lock (latest) Add(name, version);
+                            }
+                            catch (Exception ex)
+                            {
+                                if (Interlocked.Increment(ref errors) == 1)
+                                {
+                                    GuiAction.Log.Warning("Could not check {0} for updates: {1}", repository.Url, ex.Message);
+                                    GuiAction.Log.Debug(ex);
+                                }
+                            }
+                        });
+                    }
+                    else
+                    {
+                        foreach (var name in names)
+                            foreach (var v in repository.Manager.GetPackageVersions(name, cancel))
+                                if (v.IsPlatformCompatible())
+                                    Add(name, v.Version);
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    GuiAction.Log.Warning("Could not check {0} for updates: {1}", repository.Url, ex.Message);
+                    GuiAction.Log.Debug(ex);
+                }
+            }
+            return latest;
+        }
+
         static IEnumerable<RepositorySettingEntry> EnabledRepositories() =>
             PackageManagerSettings.Current.Repositories.Where(r => r.IsEnabled && r.Manager != null)
                 .OrderByDescending(r => r.Manager is FilePackageRepository).ToList();
@@ -155,6 +219,15 @@ namespace OpenTap.Gui
         static string Escape(string s) => (s ?? "").Replace("\\", "\\\\").Replace("\"", "\\\"");
 
         static List<PackageInfo> Query(HttpPackageRepository repository, string body)
+        {
+            var root = QueryRoot(repository, body);
+            if (!root.TryGetProperty("packages", out var packages) || packages.ValueKind != JsonValueKind.Array)
+                return new List<PackageInfo>();
+            return packages.EnumerateArray().Select(PackageInfo.FromJson).ToList();
+        }
+
+        /// <summary> Runs a GraphQL query and returns its "data" element. </summary>
+        static JsonElement QueryRoot(HttpPackageRepository repository, string body)
         {
             object response = repository.QueryGraphQL("query Query { " + body + " }");
             var json = response switch
@@ -166,18 +239,17 @@ namespace OpenTap.Gui
             using var doc = JsonDocument.Parse(json ?? "{}");
             var root = doc.RootElement;
             if (root.TryGetProperty("data", out var data)) root = data;
-            if (!root.TryGetProperty("packages", out var packages) || packages.ValueKind != JsonValueKind.Array)
-                return new List<PackageInfo>();
-            return packages.EnumerateArray().Select(PackageInfo.FromJson).ToList();
+            return root.Clone();
         }
 
         /// <summary> Formats package details. Port of the TUI's PackageDetailsView.LoadPackage. </summary>
-        public static string Details(PackageInfo package, List<PackageDef> installed, PackageDef installedOpenTap, bool latest)
+        public static string Details(PackageInfo package, List<PackageDef> installed, PackageDef installedOpenTap, bool latest, SemanticVersion update = null)
         {
             if (package == null) return "";
             var installedVersion = installed.FirstOrDefault(i => i.Name == package.Name)?.Version;
             var sb = new StringBuilder();
             sb.AppendLine($"Name: {package.Name}{(installedVersion != null ? $"  (installed: {installedVersion})" : "")}");
+            if (update != null) sb.AppendLine($"Update available: {update}");
             if (package.Owner != null) sb.AppendLine($"Owner: {package.Owner}");
             if (package.SourceUrl != null) sb.AppendLine($"Source: {package.SourceUrl}");
             if (package.Version != null) sb.AppendLine($"{(latest ? "Latest " : "")}Version: {package.Version}");
@@ -252,7 +324,12 @@ namespace OpenTap.Gui
         readonly PackageDef installedOpenTap;
         List<PackageDef> installed;
         List<PackageInfo> packages = new List<PackageInfo>();
+        /// <summary> Newest compatible release of each installed package; null while checking. </summary>
+        Dictionary<string, SemanticVersion> latestReleases;
         CancellationTokenSource loading;
+
+        static readonly Color UpdateBackColor = Color.FromArgb(255, 236, 179);
+        static readonly Color UpdateForeColor = Color.FromArgb(150, 75, 0);
 
         public PackageManagerForm()
         {
@@ -325,6 +402,7 @@ namespace OpenTap.Gui
             var cts = loading = new CancellationTokenSource();
             status.Text = "Packages (loading...)";
             tree.Nodes.Clear();
+            latestReleases = null;
             Task.Run(() =>
             {
                 List<PackageInfo> result;
@@ -338,20 +416,45 @@ namespace OpenTap.Gui
                     GuiAction.Log.Debug(ex);
                     result = new List<PackageInfo>();
                 }
-                if (cts.IsCancellationRequested || IsDisposed) return;
+                if (!OnUi(cts, () => { packages = result; FillTree(); })) return;
+
+                // Then look for newer versions of the installed packages.
+                Dictionary<string, SemanticVersion> latest;
                 try
                 {
-                    BeginInvoke(new Action(() =>
-                    {
-                        packages = result;
-                        FillTree();
-                    }));
+                    latest = PackageQueries.GetLatestReleases(installation.GetPackages(), installedOpenTap, cts.Token);
                 }
-                catch (InvalidOperationException)
+                catch (Exception ex)
                 {
-                    // Window closed.
+                    GuiAction.Log.Warning("Could not check for updates: " + ex.Message);
+                    GuiAction.Log.Debug(ex);
+                    latest = new Dictionary<string, SemanticVersion>();
                 }
+                OnUi(cts, () => { latestReleases = latest; FillTree(); });
             });
+        }
+
+        /// <summary> Runs an action on the UI thread unless loading was cancelled or the window closed. </summary>
+        bool OnUi(CancellationTokenSource cts, Action action)
+        {
+            if (cts.IsCancellationRequested || IsDisposed) return false;
+            try
+            {
+                BeginInvoke(new Action(() => { if (!cts.IsCancellationRequested) action(); }));
+                return true;
+            }
+            catch (InvalidOperationException)
+            {
+                return false; // Window closed.
+            }
+        }
+
+        /// <summary> The newer version available for an installed package, or null. </summary>
+        SemanticVersion UpdateFor(string name)
+        {
+            var installedVersion = installed.FirstOrDefault(p => p.Name == name)?.Version;
+            if (installedVersion == null || latestReleases == null || !latestReleases.TryGetValue(name, out var latest)) return null;
+            return latest.CompareTo(installedVersion) > 0 ? latest : null;
         }
 
         void FillTree()
@@ -373,30 +476,43 @@ namespace OpenTap.Gui
             foreach (var package in visible)
             {
                 var nodes = tree.Nodes;
+                var groupNodes = new List<TreeNode>();
                 foreach (var group in (package.Group ?? "").Split(new[] { '\\', '/' }, StringSplitOptions.RemoveEmptyEntries))
                 {
                     var groupNode = nodes.Cast<TreeNode>().FirstOrDefault(n => n.Tag == null && n.Text == group) ?? nodes.Add(group);
+                    groupNodes.Add(groupNode);
                     nodes = groupNode.Nodes;
                 }
                 var isInstalled = installedNames.Contains(package.Name);
-                var node = nodes.Add(package.Name + (isInstalled ? "  (installed)" : ""));
+                var update = isInstalled ? UpdateFor(package.Name) : null;
+                var node = nodes.Add(package.Name + (update != null ? $"  (installed, update available: {update})" : isInstalled ? "  (installed)" : ""));
                 node.Tag = package;
                 node.NodeFont = Font;
-                if (isInstalled) node.ForeColor = Color.DarkGreen;
+                if (update != null)
+                {
+                    node.ForeColor = UpdateForeColor;
+                    node.BackColor = UpdateBackColor;
+                    // Show folded groups that hide an update in the same colour.
+                    foreach (var g in groupNodes) g.ForeColor = UpdateForeColor;
+                }
+                else if (isInstalled) node.ForeColor = Color.DarkGreen;
                 if (package.Name == selectedName) select = node;
             }
             if (filter.Length > 0) tree.ExpandAll();
             tree.EndUpdate();
             if (select != null) tree.SelectedNode = select;
 
-            status.Text = $"Packages ({visible.Count}{(filter.Length > 0 ? $" of {packages.Count}" : "")})";
+            var updates = latestReleases == null ? -1 : installed.Count(p => UpdateFor(p.Name) != null);
+            status.Text = $"Packages ({visible.Count}{(filter.Length > 0 ? $" of {packages.Count}" : "")})" +
+                (updates < 0 ? " - checking for updates..." : updates == 0 ? "" : $" - {updates} update{(updates == 1 ? "" : "s")} available");
+            status.ForeColor = updates > 0 ? UpdateForeColor : SystemColors.ControlText;
             ShowDetails();
         }
 
         void ShowDetails()
         {
             var package = tree.SelectedNode?.Tag as PackageInfo;
-            details.Text = PackageQueries.Details(package, installed, installedOpenTap, true);
+            details.Text = PackageQueries.Details(package, installed, installedOpenTap, true, package == null ? null : UpdateFor(package.Name));
             manageButton.Enabled = package != null;
         }
 

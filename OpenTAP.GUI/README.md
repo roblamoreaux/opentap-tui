@@ -84,6 +84,15 @@ from each step's "Limits" settings as saved with the step run (the same data the
 Failed steps are highlighted, values outside their limits are marked red when Check Limits is on, columns sort
 (numbers numerically) and Ctrl+C copies the selected rows with headers.
 
+- The results viewer's **Database** drop-down chooses where runs are read from: all result stores in Result
+  Settings, one of them (for example PostgreSQL), or a `.TapResults` file picked with an Open dialog (read through
+  a SQLite result store from the "SQLite and PostgreSQL" package; the last 5 files are listed). The choice is
+  remembered (GUI Settings). Errors a store logs while reading (such as a failed PostgreSQL login) are shown in
+  the status bar, since result stores report them in the log rather than throwing.
+- The package manager highlights installed packages that have a newer release (not pre-release) available for
+  this OS and architecture, like the "update available" note of `tap package list`, and shows the count above the
+  list. The check runs in the background after the list loads (one query per installed package).
+
 Differences from the TUI worth knowing:
 - The results viewer also plots text columns whose values are all numbers (e.g. values captured by a
   "Run Program" regular expression, or stored as text by a result listener); the TUI skipped those.

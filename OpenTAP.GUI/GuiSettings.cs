@@ -24,6 +24,14 @@ namespace OpenTap.Gui
         [Browsable(false)]
         public string OpenPanels { get; set; } = "";
 
+        /// <summary> Database the results viewer reads: "" = all result stores, "store:Name" or "file:path". </summary>
+        [Browsable(false)]
+        public string ResultsSource { get; set; } = "";
+
+        /// <summary> Result database files opened in the results viewer, newest first, separated by '|'. </summary>
+        [Browsable(false)]
+        public string RecentResultFiles { get; set; } = "";
+
         /// <summary> Width of the Settings pane as a percentage of the window, as the user last left it. </summary>
         [Browsable(false)]
         public double SettingsPanePercent { get; set; } = 55;

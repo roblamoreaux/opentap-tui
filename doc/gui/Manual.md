@@ -325,7 +325,7 @@ The **Tools** menu opens two windows that work alongside the main window; each c
 
 Use it to see what is installed and to install, update or remove OpenTAP packages.
 
-1. **Tools > Package Manager**. The list loads from the repositories **set in the package manager window's own Settings menu** (packages.opentap.io by default); installed packages are listed first, in green.
+1. **Tools > Package Manager**. The list loads from the repositories **set in the package manager window's own Settings menu** (packages.opentap.io by default); installed packages are listed first, in green. A moment later, installed packages with a newer release for your system are highlighted in orange with the new version, for example *OpenTAP (installed, update available: 9.35.3)*, and the heading above the list says how many updates there are.
 2. Type in **Search packages** to narrow the list, then click a package to see its details: version, owner, compatibility and description with links.
 3. Click **Install / Uninstall...** (or double-click the package). The version window lists every version available for your OpenTAP, newest first, with the installed one marked.
 4. Select a version and click **Install**, or click **Uninstall** on the installed version. A progress bar and the log show what happens; **Cancel** stops it.
@@ -334,7 +334,15 @@ Close the GUI and start it again after installing or removing packages so OpenTA
 
 ### Results Viewer
 
-The results viewer reads runs from the result stores set under **Settings > Results** (for example SQLite). It has three parts.
+The results viewer reads runs from the result stores set under **Settings > Results** (for example SQLite or PostgreSQL), or from a results file you open. It has three parts.
+
+**Database** (toolbar). Choose where the runs come from:
+
+- **All result stores** reads every store under Settings > Results.
+- A store's name (for example **PostgreSQL** or **SQLite**) reads only that store.
+- **Open TapResults file...** opens a `.TapResults` file (or another SQLite results database) from anywhere, for example one copied from another bench. The last 5 files you opened are listed for quick access.
+
+Your choice is remembered for next time. If a database cannot be read (for example a PostgreSQL server that needs a password), the reason is shown in red in the status bar. Opening files needs the *SQLite and PostgreSQL* package.
 
 **Run list** (top). One row per test plan run, with Run ID, name, verdict, start time, result names and source. **Refresh** reads the stores again; **Result Settings...** opens the result listener settings.
 
